@@ -1,0 +1,15 @@
+# Tested Windows build environment; install after requirements.txt.
+numpy==2.5.3
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.7
+pytest==9.1.1
+pytest-qt==4.5.0
+winrt-runtime==3.2.1
+winrt-Windows.Devices.Bluetooth==3.2.1
+winrt-Windows.Devices.Bluetooth.Advertisement==3.2.1
+winrt-Windows.Devices.Bluetooth.GenericAttributeProfile==3.2.1
+winrt-Windows.Devices.Enumeration==3.2.1
+winrt-Windows.Devices.Radios==3.2.1
+winrt-Windows.Foundation==3.2.1
+winrt-Windows.Foundation.Collections==3.2.1
+winrt-Windows.Storage.Streams==3.2.1

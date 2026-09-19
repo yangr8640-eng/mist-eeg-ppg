@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mist-eeg-ppg"
+version = "0.1.0"
+description = "Windows MIST experiment with QX-EEG-4 and Arduino RED PPG acquisition"
+requires-python = ">=3.11,<3.15"
+dependencies = ["PySide6==6.11.2", "bleak==3.0.2", "pyserial==3.5", "pyqtgraph==0.14.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pytest-qt==4.5.0", "pyinstaller==6.22.3"]
+
+[project.gui-scripts]
+mist-eeg-ppg = "mist_app.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["mist_app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+qt_api = "pyside6"
