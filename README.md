@@ -2,11 +2,17 @@
 
 Windows 中文桌面程序：在同一界面连接 QX-EEG-4 脑环和 Arduino RED PPG 指夹，执行六阶段 MIST，按被试、阶段、尝试分别保存数据。
 
+**[下载 Windows 64 位免安装运行包（v0.1.0，约 62 MB）](https://github.com/yangr8640-eng/mist-eeg-ppg/releases/download/v0.1.0/MIST-EEG-PPG-Windows-x64.zip)** · [查看 Release 与校验文件](https://github.com/yangr8640-eng/mist-eeg-ppg/releases/tag/v0.1.0)
+
+在其他 Windows 电脑上下载 ZIP，完整解压后双击 `MIST-EEG-PPG.exe` 即可启动，不需要安装 Python，也不依赖开发电脑的文件路径。请下载上述运行包；GitHub 自动提供的 `Source code` 是开发源码。
+
 **当前为软件验证版本，真实设备尚未验收。** 模拟设备、协议解析和流程测试不等同于硬件兼容性或同步精度验证。开发时设备暂在实验室，真实采集能力将在实际接入后确认。
 
 ## 使用
 
 下载 Release 中的 Windows ZIP，完整解压，双击 `MIST-EEG-PPG.exe`。同目录的 `_internal` 文件夹必须保留。无需安装 Python。
+
+已在 Windows 11 x64 验证。连接真实设备时，电脑需要可用的 BLE 蓝牙适配器和指夹 USB 串口驱动；暂时没有设备时可双击 `Start-Simulation.cmd` 检查程序流程。
 
 1. 开启脑环，插入指夹 USB；关闭厂商采集软件和 Arduino 串口监视器。
 2. 在右侧扫描脑环、选择串口并连接。两路连续有效数据达到 3 秒后填写被试信息。
