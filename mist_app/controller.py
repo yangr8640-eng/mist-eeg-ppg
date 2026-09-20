@@ -9,7 +9,8 @@ from collections import deque
 from pathlib import Path
 
 from .clock import SessionClock
-from .devices import EEGDevice, PPGDevice, SimulatedDevice, list_ppg, scan_eeg
+from .devices import (EEGDevice, PPGDevice, TemperatureDevice, SimulatedDevice,
+                      list_ppg, list_temperature, scan_eeg)
 from .models import DEFAULT_STAGES, DeviceMessage, EEG_UV_PER_COUNT, Stage
 from .paradigm import FEEDBACK_SECONDS, FIXATION_SECONDS, MistTask
 from .storage import SessionRecorder, safe_id
@@ -25,7 +26,12 @@ INSTRUCTIONS = {
 
 
 class DeviceHealth:
-    def __init__(self):
+    def __init__(self, device="ppg"):
+        self.device = device
+        # The temperature stream is low frequency. Do not apply the EEG/PPG
+        # half-second continuity requirement to ~1 Hz temperature reports.
+        self.continuity_ns = 1_500_000_000 if device == "temperature" else 500_000_000
+        self.stale_ns = 3_000_000_000
         self.connected = False
         self.first_valid = None
         self.last_valid = None
@@ -45,6 +51,10 @@ class DeviceHealth:
             self.connected = True
             self.first_valid = self.last_valid = None
             self.rates.clear()
+            self.preview.clear()
+            self.recent.clear()
+            self.meta.clear()
+            self.meta.update(msg.meta)
             self.error = ""
         elif msg.kind in ("disconnected", "error"):
             self.connected = False
@@ -58,12 +68,12 @@ class DeviceHealth:
         if msg.error:
             self.error = msg.error
         if msg.samples:
-            if self.last_valid is None or msg.received_ns - self.last_valid > 500_000_000:
+            if self.last_valid is None or msg.received_ns - self.last_valid >= self.continuity_ns:
                 self.first_valid = msg.received_ns
             self.last_valid = msg.received_ns
             self.samples += len(msg.samples)
             self.rates.append((msg.received_ns, len(msg.samples)))
-            self.error = ""
+            self.error = msg.error
             while self.rates and msg.received_ns - self.rates[0][0] > 5_000_000_000:
                 self.rates.popleft()
             for i, values in enumerate(msg.samples):
@@ -76,7 +86,7 @@ class DeviceHealth:
 
     def ready(self, now):
         return bool(self.connected and self.first_valid is not None and self.last_valid is not None
-            and now - self.last_valid < 500_000_000 and self.last_valid - self.first_valid >= 3_000_000_000)
+            and now - self.last_valid < self.continuity_ns and self.last_valid - self.first_valid >= 3_000_000_000)
 
     def snapshot(self, now, saved):
         age = (now - self.last_valid) / 1e9 if self.last_valid is not None else None
@@ -90,20 +100,24 @@ class DeviceHealth:
             "rate": rate if age is not None and age < 3 else 0,
             "samples": self.samples, "saved_samples": saved, "last_age": age,
             "error": self.error, "identifier": self.identifier,
+            "temperature_c": self.preview[-1][1][0] if self.device == "temperature" and self.preview else None,
             "electrode_off": self.meta.get("electrode_off", self.meta.get("lead_off")),
             "battery_raw": self.meta.get("battery_raw"), "preview": list(self.preview)}
 
 
 class ExperimentController:
-    def __init__(self, simulate=False, output_root=None):
+    def __init__(self, simulate=False, output_root=None, temperature_enabled=True):
         self.simulate = simulate
+        self.temperature_enabled = bool(temperature_enabled)
         self.output_root = Path(output_root or Path.home() / "Desktop" / "MIST_data")
         self._lock = threading.RLock()
         self._stop = threading.Event()
-        self._health = {d: DeviceHealth() for d in ("eeg", "ppg")}
+        self._health = {d: DeviceHealth(d) for d in ("eeg", "ppg", "temperature")}
+        self._connecting = set()
         self._devices = {
             "eeg": SimulatedDevice("eeg", self._on_message) if simulate else EEGDevice(self._on_message),
             "ppg": SimulatedDevice("ppg", self._on_message) if simulate else PPGDevice(self._on_message),
+            "temperature": SimulatedDevice("temperature", self._on_message) if simulate else TemperatureDevice(self._on_message),
         }
         self.state = "setup"
         self.stages = list(DEFAULT_STAGES)
@@ -133,7 +147,7 @@ class ExperimentController:
         self._after_save = "rating"
         self._release_devices = False
         self._closed = False
-        self._set_scene("instruction", "连接设备", "连接脑环与指夹，连续收到有效数据 3 秒后填写被试信息。")
+        self._set_scene("instruction", "连接设备", "连接脑环、指夹及已启用的温度传感器，连续收到有效数据 3 秒后填写被试信息。")
         self._thread = threading.Thread(target=self._run, name="experiment-clock", daemon=True)
         self._thread.start()
 
@@ -143,21 +157,60 @@ class ExperimentController:
     def list_ppg(self):
         return [{"device": "SIM-PPG", "description": "模拟 RED PPG"}] if self.simulate else list_ppg()
 
+    def list_temperature(self):
+        return [{"device": "SIM-TEMPERATURE", "description": "模拟 GT-M601 温度"}] if self.simulate else list_temperature()
+
+    @property
+    def enabled_devices(self):
+        return ("eeg", "ppg", "temperature") if self.temperature_enabled else ("eeg", "ppg")
+
+    def set_temperature_enabled(self, enabled):
+        with self._lock:
+            if self.state != "setup" or self.recorder:
+                raise RuntimeError("建立会话后不能更改温度采集配置。")
+            enabled = bool(enabled)
+            if enabled == self.temperature_enabled:
+                return
+            self.temperature_enabled = enabled
+        if not enabled:
+            self._devices["temperature"].disconnect()
+            with self._lock:
+                self._connecting.discard("temperature")
+                self._health["temperature"] = DeviceHealth("temperature")
+
     def connect_eeg(self, address):
         self._connect("eeg", address)
 
     def connect_ppg(self, port):
         self._connect("ppg", port)
 
+    def connect_temperature(self, port):
+        self._connect("temperature", port)
+
     def _connect(self, device, identifier):
+        identifier = str(identifier).strip()
         if not str(identifier).strip():
             raise ValueError("请先选择设备或填写连接地址。")
         with self._lock:
             if self.state in ("running", "saving", "completed", "aborted", "error"):
                 raise RuntimeError("当前状态不能重新连接；请等待阶段结束或重新打开程序。")
+            if device not in self.enabled_devices:
+                raise RuntimeError("请先启用温度采集。")
+            if device in self._connecting or self._health[device].connected:
+                raise RuntimeError("设备已经连接或正在连接，请先断开。")
+            if device in ("ppg", "temperature"):
+                other = "temperature" if device == "ppg" else "ppg"
+                canonical = lambda port: str(port).strip().upper().removeprefix("\\\\.\\")
+                if (self._health[other].connected or other in self._connecting) and canonical(self._health[other].identifier) == canonical(identifier):
+                    raise ValueError("指夹与温度传感器不能使用同一个串口，请选择各自的 USB 设备。")
             self._health[device].identifier = str(identifier)
             self._health[device].error = ""
-        self._devices[device].connect(str(identifier))
+            self._connecting.add(device)
+            try:
+                self._devices[device].connect(str(identifier))
+            except Exception:
+                self._connecting.discard(device)
+                raise
 
     def disconnect_device(self, device):
         if device not in self._devices:
@@ -169,15 +222,20 @@ class ExperimentController:
         self._devices[device].disconnect()
 
     def _ready(self, now):
-        return all(health.ready(now) for health in self._health.values())
+        return all(self._health[d].ready(now) for d in self.enabled_devices)
 
     def create_session(self, participant, durations, output_root=None):
         with self._lock:
             if self.state != "setup" or self.recorder:
                 raise RuntimeError("已经建立会话；请完成或退出后重新开始。")
             if not self._ready(time.perf_counter_ns()):
-                raise RuntimeError("两台设备均需连续收到有效数据至少 3 秒。")
+                raise RuntimeError("所有已启用设备均需连续收到有效数据至少 3 秒。")
             participant = dict(participant)
+            if self.temperature_enabled:
+                site = str(participant.get("temperature_site", "")).strip()
+                if not site:
+                    raise ValueError("请填写温度测量部位，例如左前臂皮肤。")
+                participant["temperature_site"] = site
             participant["id"] = safe_id(str(participant.get("id", participant.get("participant_id", ""))))
             try:
                 age = int(participant.get("age", 0))
@@ -193,11 +251,17 @@ class ExperimentController:
                     raise ValueError("阶段时长应为 1–3600 秒。")
                 stages.append(Stage(stage.key, stage.name, duration))
             self.clock = SessionClock()
-            self.recorder = SessionRecorder(Path(output_root or self.output_root), participant, stages, self.simulate, self.clock)
+            self.recorder = SessionRecorder(Path(output_root or self.output_root), participant, stages, self.simulate, self.clock,
+                enabled_devices=self.enabled_devices,
+                temperature_config={"model": "GT-M601", "transport": "serial_usb_or_bluetooth_receiver",
+                    "port": self._health["temperature"].identifier, "baud_rate": 115200,
+                    "protocol": "gt-m601-ascii", "measurement_site": participant.get("temperature_site", ""),
+                    "continuity_seconds": 1.5, "stale_seconds": 3.0,
+                    "timing_basis": "host_receive"} if self.temperature_enabled else None)
             self.stages = stages
             self.state = "instruction"
             self.recorder.event("session_created", time.perf_counter_ns(),
-                devices={d: h.identifier for d, h in self._health.items()})
+                devices={d: self._health[d].identifier for d in self.enabled_devices})
             self._instruction()
 
     def _instruction(self):
@@ -221,7 +285,7 @@ class ExperimentController:
             if self.state not in ("instruction", "interrupted"):
                 raise RuntimeError("当前阶段尚不能开始。")
             if not self._ready(time.perf_counter_ns()):
-                raise RuntimeError("请先恢复两台设备并等待连续 3 秒有效数据。")
+                raise RuntimeError("请先恢复所有已启用设备并等待连续 3 秒有效数据。")
             stage = self.stages[self.stage_index]
             self.attempt = self._attempt_numbers.get(stage.key, 0) + 1
             self._attempt_numbers[stage.key] = self.attempt
@@ -266,7 +330,8 @@ class ExperimentController:
                 self.recorder.event("stage_start", at, stage=self.window.stage.key, attempt=self.attempt,
                     planned_end_ns=self.window.end_ns)
                 # The paint callback may be queued behind device callbacks: recover its tiny pre-roll.
-                for health in self._health.values():
+                for device in self.enabled_devices:
+                    health = self._health[device]
                     for msg, seq in health.recent:
                         if at <= msg.received_ns < self.window.end_ns:
                             self.recorder.packet(msg, seq)
@@ -282,6 +347,10 @@ class ExperimentController:
 
     def _on_message(self, msg: DeviceMessage):
         with self._lock:
+            if msg.kind in ("connected", "disconnected", "error"):
+                self._connecting.discard(msg.device)
+            if msg.device not in self.enabled_devices:
+                return
             health = self._health[msg.device]
             health.update(msg)
             if self.recorder and msg.kind != "packet":
@@ -425,8 +494,9 @@ class ExperimentController:
             self._release_devices = True
             self._set_scene("instruction", "记录发生错误，实验已停止", self.last_error)
         if self.state == "running":
-            for device, health in self._health.items():
-                if not health.connected or health.last_valid is None or now - health.last_valid >= 3_000_000_000:
+            for device in self.enabled_devices:
+                health = self._health[device]
+                if not health.connected or health.last_valid is None or now - health.last_valid >= health.stale_ns:
                     self._end_stage(now, False, f"{device} 断开或连续 3 秒无有效数据")
                     break
         if self.state == "running":
@@ -454,9 +524,10 @@ class ExperimentController:
                         "感谢参与。同伴平均和目标成绩用于构造实验压力情境，不代表对您个人能力的评价。所有已采数据均已保存在本机会话文件夹。")
                 return
             if self.window is not None:
-                # Each source delivers in order. Wait for both receive watermarks to pass the boundary.
+                # Each enabled source delivers in order. Wait for receive watermarks to pass the boundary.
                 drained = all(h.last_message >= self.window.end_ns or not h.connected or
-                    now - (h.last_valid or self.window.end_ns) >= 3_000_000_000 for h in self._health.values())
+                    now - (h.last_valid or self.window.end_ns) >= h.stale_ns
+                    for h in (self._health[d] for d in self.enabled_devices))
                 if self._close_done is None and drained:
                     self._close_done = self.recorder.finish_stage(self.window)
                 if self._close_done is not None and self._close_done.is_set():
@@ -498,7 +569,9 @@ class ExperimentController:
                 scene["deadline_seconds"] = max(0, (self._phase_deadline - now) / 1e9)
             return {"mode": "simulate" if self.simulate else "hardware", "state": self.state,
                 "ready": self._ready(now),
-                "devices": {d: h.snapshot(now, self.recorder.saved_counts[d] if self.recorder else 0) for d, h in self._health.items()},
+                "temperature_enabled": self.temperature_enabled,
+                "devices": {d: {**h.snapshot(now, self.recorder.saved_counts.get(d, 0) if self.recorder else 0),
+                    "enabled": d in self.enabled_devices} for d, h in self._health.items()},
                 "session_path": str(self.recorder.path) if self.recorder else "",
                 "stage_index": self.stage_index, "stage_key": stage.key, "stage_name": stage.name,
                 "duration": stage.duration, "remaining": remaining, "attempt": self.attempt,

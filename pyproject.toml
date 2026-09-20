@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mist-eeg-ppg"
-version = "0.1.0"
-description = "Windows MIST experiment with QX-EEG-4 and Arduino RED PPG acquisition"
+version = "0.2.0"
+description = "Windows MIST experiment with EEG, RED PPG and GT-M601 contact temperature acquisition"
 requires-python = ">=3.11,<3.15"
 dependencies = ["PySide6==6.11.2", "bleak==3.0.2", "pyserial==3.5", "pyqtgraph==0.14.0"]
 

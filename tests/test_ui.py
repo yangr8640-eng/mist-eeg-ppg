@@ -12,11 +12,12 @@ from mist_app.ui import MainWindow
 
 class FakeController:
     def __init__(self):
-        device = dict(connected=False, ready=False, streaming=False, rate=0,
+        device = dict(enabled=True, connected=False, ready=False, streaming=False, rate=0,
                       samples=0, saved_samples=0, last_age=None, error="",
                       identifier="", electrode_off=False, battery_raw=None, preview=[])
-        self.data = dict(mode="simulate", state="setup", ready=False,
-                         devices={"eeg": dict(device), "ppg": dict(device)},
+        self.data = dict(mode="simulate", state="setup", ready=False, temperature_enabled=True,
+                         devices={"eeg": dict(device), "ppg": dict(device),
+                                  "temperature": dict(device, temperature_c=None)},
                          session_path="", stage_index=0, stage_key="eyes_open",
                          stage_name="睁眼静息", duration=180, remaining=180,
                          attempt=1, scene=dict(id=1, kind="instruction", text="开始实验", detail=""),
@@ -35,6 +36,18 @@ class FakeController:
         self.scan_threads.append(threading.get_ident())
         return [{"device": "COM7", "description": "测试指夹"}]
 
+    def list_temperature(self):
+        self.scan_threads.append(threading.get_ident())
+        return [{"device": "COM8", "description": "温度蓝牙接收器"}]
+
+    def set_temperature_enabled(self, enabled):
+        if self.data["state"] != "setup":
+            raise RuntimeError("会话建立后不可修改温度采集设置")
+        self.data["temperature_enabled"] = enabled
+        self.data["devices"]["temperature"]["enabled"] = enabled
+        self.data["ready"] = all(device["ready"] for device in self.data["devices"].values()
+                                 if device["enabled"])
+
     def scan_eeg(self):
         self.scan_threads.append(threading.get_ident())
         return [{"name": "测试脑环", "address": "00:11:22:33:44:55"}]
@@ -49,6 +62,9 @@ class FakeController:
 
     def connect_ppg(self, port):
         self.data["devices"]["ppg"]["identifier"] = port
+
+    def connect_temperature(self, port):
+        self.data["devices"]["temperature"]["identifier"] = port
 
     def disconnect_device(self, kind):
         self.data["devices"][kind]["connected"] = False
@@ -96,11 +112,12 @@ def window(qtbot, tmp_path):
     widget.close()
 
 
-def test_information_and_start_require_both_devices_ready(window, qtbot):
+def test_information_and_start_require_all_enabled_devices_ready(window, qtbot):
     widget, controller = window
     assert not widget.subject_id.isEnabled()
     assert not widget.create_button.isEnabled()
     controller.data["devices"]["eeg"].update(connected=True, ready=True)
+    controller.data["devices"]["ppg"].update(connected=True, ready=True)
     widget.refresh()
     assert not widget.subject_id.isEnabled()
     controller.set_ready()
@@ -110,11 +127,14 @@ def test_information_and_start_require_both_devices_ready(window, qtbot):
     widget.subject_id.setText("P001")
     widget.age.setValue(30)
     widget.sex.setCurrentIndex(1)
+    widget.temperature_site.setText("左侧前臂内侧")
     qtbot.mouseClick(widget.create_button, QtCore.Qt.MouseButton.LeftButton)
-    assert controller.created[0] == {"id": "P001", "age": 30, "sex": "female", "note": ""}
+    assert controller.created[0] == {"id": "P001", "age": 30, "sex": "female", "note": "",
+                                     "temperature_site": "左侧前臂内侧"}
     assert set(controller.created[1].values()) == {180.0}
     assert widget.pages.currentIndex() == 1
     assert not widget.simulation.isEnabled()
+    assert not widget.temperature_enabled.isEnabled()
     controller.set_ready(False)
     widget.refresh()
     assert not widget.stage_action.isEnabled()
@@ -156,6 +176,111 @@ def test_scanning_runs_off_gui_thread_and_selects_real_identifier(window, qtbot)
     widget._connect("eeg")
     qtbot.waitUntil(lambda: "connect_eeg" not in widget._busy)
     assert controller.data["devices"]["eeg"]["identifier"] == "00:11:22:33:44:55"
+    widget._scan("temperature")
+    qtbot.waitUntil(lambda: "scan_temperature" not in widget._busy)
+    assert widget.cards["temperature"].device_picker.currentData() == "COM8"
+    widget._connect("temperature")
+    qtbot.waitUntil(lambda: "connect_temperature" not in widget._busy)
+    assert controller.data["devices"]["temperature"]["identifier"] == "COM8"
+    assert all(ident != threading.get_ident() for ident in controller.scan_threads)
+
+
+def test_temperature_can_be_disabled_before_session_and_skips_site(window, qtbot):
+    widget, controller = window
+    for kind in ("eeg", "ppg"):
+        controller.data["devices"][kind].update(connected=True, ready=True)
+    qtbot.mouseClick(widget.temperature_enabled, QtCore.Qt.MouseButton.LeftButton)
+    assert not controller.data["temperature_enabled"]
+    assert not widget.temperature_site.isVisible()
+    assert widget.cards["temperature"].status.text() == "未启用"
+    assert widget.create_button.isEnabled()
+    widget.subject_id.setText("NO_TEMP")
+    widget.sex.setCurrentIndex(1)
+    qtbot.mouseClick(widget.create_button, QtCore.Qt.MouseButton.LeftButton)
+    assert "temperature_site" not in controller.created[0]
+    assert not widget.temperature_enabled.isEnabled()
+
+
+def test_temperature_site_is_required_and_old_values_are_marked_stale(window, qtbot):
+    widget, controller = window
+    controller.set_ready()
+    widget.refresh()
+    widget.subject_id.setText("P_TEMP")
+    widget.sex.setCurrentIndex(1)
+    errors = []
+    widget._error = errors.append
+    qtbot.mouseClick(widget.create_button, QtCore.Qt.MouseButton.LeftButton)
+    assert controller.created is None
+    assert "温度测量部位" in errors[0]
+    device = controller.data["devices"]["temperature"]
+    device.update(temperature_c=33.125, last_age=.2, saved_samples=6, rate=1)
+    widget.refresh()
+    card = widget.cards["temperature"]
+    assert card.temperature_value.text() == "33.1 °C"
+    assert "最近更新 0.2 秒前" in card.details.text()
+    device.update(streaming=False, ready=False, last_age=4.2)
+    widget.refresh()
+    assert "上次 33.1 °C · 已过期" == card.temperature_value.text()
+    assert card.status.text() == "等待更新"
+    device.update(connected=False, error="串口断开")
+    widget.refresh()
+    assert "已过期" in card.temperature_value.text()
+    assert card.status.text() == "连接异常"
+
+
+def test_temperature_plot_uses_absolute_celsius(window):
+    widget, controller = window
+    card = widget.cards["temperature"]
+    card.update_plot({"preview": [(10.0, [32.75]), (11.0, [32.8]), (12.0, [32.85])]})
+    x, y = card.curves[0].getData()
+    assert x.tolist() == [-2, -1, 0]
+    assert y.tolist() == [32.75, 32.8, 32.85]
+    low, high = card.plot.viewRange()[1]
+    assert low < 32.75 < 32.85 < high
+
+
+def test_simulation_switch_preserves_temperature_setting(window, qtbot, monkeypatch):
+    widget, controller = window
+    qtbot.mouseClick(widget.temperature_enabled, QtCore.Qt.MouseButton.LeftButton)
+    replacements = []
+
+    def replace_controller(*, simulate, output_root, temperature_enabled):
+        replacement = FakeController()
+        replacement.data["mode"] = "simulate" if simulate else "hardware"
+        replacement.set_temperature_enabled(temperature_enabled)
+        replacements.append(replacement)
+        return replacement
+
+    monkeypatch.setattr("mist_app.ui.ExperimentController", replace_controller)
+    qtbot.mouseClick(widget.simulation, QtCore.Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: not widget._busy)
+    assert controller.closed
+    assert widget.controller is replacements[0]
+    assert not widget.controller.data["temperature_enabled"]
+    assert not widget.temperature_enabled.isChecked()
+    assert not widget.cards["temperature"].device_picker.isVisible()
+    qtbot.mouseClick(widget.temperature_enabled, QtCore.Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: not widget._busy)
+    assert widget.cards["temperature"].device_picker.isVisible()
+    assert widget.cards["temperature"].device_picker.currentData() == "COM8"
+
+
+@pytest.mark.parametrize("size", [(1360, 900), (1080, 750)])
+def test_three_cards_fit_sidebar_during_recording(window, qtbot, size):
+    widget, controller = window
+    controller.set_ready()
+    controller.data.update(state="running", session_path="C:/test/P001")
+    controller.data["devices"]["temperature"].update(temperature_c=32.5, last_age=.2)
+    widget.resize(*size)
+    widget.refresh()
+    qtbot.wait(50)
+    viewport = widget.cards["temperature"].parentWidget().parentWidget()
+    for card in widget.cards.values():
+        assert not card.device_picker.isVisible()
+        assert card.plot.isVisible()
+        top_left = card.mapTo(viewport, QtCore.QPoint(0, 0))
+        assert top_left.y() >= 0
+        assert top_left.y() + card.height() <= viewport.height()
 
 
 def test_presentation_is_reported_once_per_scene(window, qtbot):

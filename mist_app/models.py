@@ -12,11 +12,11 @@ READY_SECONDS = 3.0
 
 @dataclass(frozen=True)
 class DeviceMessage:
-    device: str  # eeg | ppg
+    device: str  # eeg | ppg | temperature
     kind: str  # connected | disconnected | packet | error
     received_ns: int
     raw: bytes = b""
-    samples: tuple[tuple[int, ...], ...] = ()
+    samples: tuple[tuple[int | float, ...], ...] = ()
     error: str = ""
     meta: dict[str, Any] = field(default_factory=dict)
 

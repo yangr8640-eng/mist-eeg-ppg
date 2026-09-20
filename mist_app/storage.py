@@ -50,7 +50,8 @@ class StageWindow:
 
 
 class Quality:
-    def __init__(self):
+    def __init__(self, gap_threshold_seconds: float = .1):
+        self.gap_threshold_seconds = gap_threshold_seconds
         self.samples = 0
         self.packets = 0
         self.invalid_packets = 0
@@ -80,7 +81,7 @@ class Quality:
             self.interval_sum += gap
             self.interval_sq_sum += gap * gap
             self.max_gap = max(self.max_gap, gap)
-            if gap >= .1:
+            if gap >= self.gap_threshold_seconds:
                 self.long_gaps += 1
         self.last_ns = msg.received_ns
         self.samples += count
@@ -89,7 +90,7 @@ class Quality:
         span = (self.last_ns - self.first_ns) / 1e9 if self.last_ns is not None else 0
         mean = self.interval_sum / self.intervals if self.intervals else 0
         variance = self.interval_sq_sum / self.intervals - mean**2 if self.intervals else 0
-        return {
+        report = {
             "samples": self.samples, "packets_or_reads": self.packets,
             "invalid_or_non_sample_reads": self.invalid_packets,
             "parse_errors": self.parse_errors,
@@ -98,17 +99,28 @@ class Quality:
             "mean_receive_interval_seconds": mean,
             "receive_interval_std_seconds": math.sqrt(max(0, variance)),
             "maximum_receive_gap_seconds": self.max_gap,
-            "receive_gaps_at_least_100ms": self.long_gaps,
+            "receive_gap_threshold_seconds": self.gap_threshold_seconds,
+            "receive_gaps_at_least_threshold": self.long_gaps,
             "exact_device_loss_count": None,
         }
+        if self.gap_threshold_seconds == .1:
+            report["receive_gaps_at_least_100ms"] = self.long_gaps
+        return report
 
 
 class SessionRecorder:
     """A single writer owns all handles; errors are latched and observed by controller."""
     def __init__(self, root: Path, participant: dict, stages: list[Stage], simulate: bool,
-                 clock: SessionClock, queue_size: int = 10000):
+                 clock: SessionClock, queue_size: int = 10000,
+                 enabled_devices: tuple[str, ...] = ("eeg", "ppg"),
+                 temperature_config: dict | None = None):
         self.clock = clock
         self.simulate = simulate
+        self.enabled_devices = tuple(dict.fromkeys(enabled_devices))
+        if not self.enabled_devices or any(d not in ("eeg", "ppg", "temperature")
+                                           for d in self.enabled_devices):
+            raise ValueError("启用的设备必须是 eeg、ppg 或 temperature，且不能为空。")
+        self.temperature_config = dict(temperature_config or {})
         root = Path(root).expanduser().resolve()
         if simulate:
             root /= "SIMULATED"
@@ -129,13 +141,14 @@ class SessionRecorder:
         self._sample_writers = {}
         self._raw_writers = {}
         self._quality = {}
-        self.saved_counts = {"eeg": 0, "ppg": 0}
+        self.saved_counts = dict.fromkeys(self.enabled_devices, 0)
         self._attempts = []
         self._manifest = {
             "schema_version": 1, "app_version": __version__, "session_id": self.session_id,
             "mode": "simulate" if simulate else "hardware", "status": "in_progress",
             "hardware_acceptance": "not_verified", "clock": clock.metadata(),
             "participant": dict(participant), "source_paradigm": SOURCE_VERSION,
+            "enabled_devices": list(self.enabled_devices),
             "stages": [dict(key=s.key, name=s.name, duration_seconds=s.duration) for s in stages],
             "recording_window": "start_ns <= host_received_ns < end_ns",
             "attempts": self._attempts,
@@ -145,6 +158,15 @@ class SessionRecorder:
                 "limitation": "Receive-time alignment only; physical acquisition and screen onset delays are unknown.",
             },
         }
+        if "temperature" in self.enabled_devices:
+            self._manifest["temperature"] = {
+                "device_model": "GT-M601", "unit": "degC",
+                "measurement": "contact_surface_temperature",
+                "measurement_note": "接触部位表面温度，不代表核心体温。",
+                "timing_basis": "host_receive",
+                "nominal_sample_rate_hz": 1.0 if simulate else None,
+                "config": self.temperature_config,
+            }
         atomic_json(self.path / "session.json", self._manifest)
         atomic_json(self.path / "participant.json", dict(participant))
         self._thread = threading.Thread(target=self._run, name="session-writer", daemon=True)
@@ -226,6 +248,7 @@ class SessionRecorder:
             "duration_seconds": max(0, window.end_ns - window.start_ns) / 1e9,
             "clock": self.clock.metadata(),
             "mode": "simulate" if self.simulate else "hardware",
+            "enabled_devices": list(self.enabled_devices),
             "quality": {d: q.report() for d, q in self._quality.items()},
             "timing_limit": "Host receive timestamps; EEG sample times are estimates. No hardware sync validation.",
         }
@@ -235,14 +258,20 @@ class SessionRecorder:
             raise RuntimeError("上阶段文件尚未关闭。")
         window.path.mkdir(exist_ok=False)
         self._window = window
-        self.saved_counts = {"eeg": 0, "ppg": 0}
-        self._quality = {"eeg": Quality(), "ppg": Quality()}
+        self.saved_counts = dict.fromkeys(self.enabled_devices, 0)
+        self._quality = {device: Quality(3.0 if device == "temperature" else .1)
+                         for device in self.enabled_devices}
         common = ["session_id", "stage", "attempt", "host_sequence", "sample_in_packet",
             "received_ns", "session_seconds", "stage_seconds"]
-        for device in ("eeg", "ppg"):
-            extra = (["estimated_sample_ns", "estimated_stage_seconds", "timing_basis"] +
-                     [f"ch{i}_raw" for i in range(1, 5)] + [f"ch{i}_uv" for i in range(1, 5)] +
-                     ["electrode_raw", "electrode_off", "battery_raw"]) if device == "eeg" else ["red"]
+        for device in self.enabled_devices:
+            if device == "eeg":
+                extra = (["estimated_sample_ns", "estimated_stage_seconds", "timing_basis"] +
+                         [f"ch{i}_raw" for i in range(1, 5)] + [f"ch{i}_uv" for i in range(1, 5)] +
+                         ["electrode_raw", "electrode_off", "battery_raw"])
+            elif device == "temperature":
+                extra = ["temperature_c", "timing_basis"]
+            else:
+                extra = ["red"]
             self._sample_writers[device] = self._open_csv(window.path / f"{window.stage.key}_{device}.csv", common + extra, True)
             raw = (window.path / f"{window.stage.key}_{device}_raw.jsonl").open("x", encoding="utf-8")
             self._raw_writers[device] = raw
@@ -252,7 +281,8 @@ class SessionRecorder:
 
     def _write_packet(self, msg, sequence):
         window = self._window
-        if window is None or not (window.start_ns <= msg.received_ns < window.end_ns):
+        if (window is None or msg.device not in self.enabled_devices
+                or not (window.start_ns <= msg.received_ns < window.end_ns)):
             return
         self._quality[msg.device].add(msg)
         self._jsonline(self._raw_writers[msg.device], {
@@ -277,6 +307,8 @@ class SessionRecorder:
                     battery_raw=msg.meta.get("battery_raw", ""))
                 row.update({f"ch{c+1}_raw": v for c, v in enumerate(sample)})
                 row.update({f"ch{c+1}_uv": v * EEG_UV_PER_COUNT for c, v in enumerate(sample)})
+            elif msg.device == "temperature":
+                row.update(temperature_c=sample[0], timing_basis="host_receive")
             else:
                 row["red"] = sample[0]
             self._sample_writers[msg.device].writerow(row)
@@ -339,6 +371,7 @@ class SessionRecorder:
                     atomic_json(self.path / "session.json", self._manifest)
                     atomic_json(self.path / "quality_report.json", {
                         "session_id": self.session_id, "status": payload,
+                        "enabled_devices": list(self.enabled_devices),
                         "hardware_alignment_error_ms": None, "hardware_acceptance": "not_verified",
                         "attempts": self._attempts, "clock": self.clock.metadata(),
                         "note": "Intervals and rates are measured host reception metrics, not measured hardware synchronization error.",

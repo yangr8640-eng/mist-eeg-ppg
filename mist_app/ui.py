@@ -177,10 +177,13 @@ class DeviceCard(QtWidgets.QFrame):
         self.kind = kind
         self.setObjectName("panel")
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(15, 14, 15, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(6)
         row = QtWidgets.QHBoxLayout()
-        row.addWidget(label("脑环 · EEG" if kind == "eeg" else "指夹 · PPG", "sectionTitle"))
+        title = label({"eeg": "脑环 · EEG", "ppg": "指夹 · PPG",
+                       "temperature": "温度 · GT-M601"}[kind], "sectionTitle")
+        title.setStyleSheet("font-size: 16px; font-weight: 600;")
+        row.addWidget(title)
         row.addStretch()
         self.status = label("未连接", "state")
         row.addWidget(self.status)
@@ -192,8 +195,10 @@ class DeviceCard(QtWidgets.QFrame):
         if kind == "eeg":
             self.device_picker.setPlaceholderText("扫描选择，或输入蓝牙地址")
             self.device_picker.lineEdit().setPlaceholderText("扫描选择，或输入蓝牙地址")
-        else:
+        elif kind == "ppg":
             self.device_picker.setPlaceholderText("选择指夹串口")
+        else:
+            self.device_picker.setPlaceholderText("选择蓝牙接收器 / USB 串口")
         layout.addWidget(self.device_picker)
         actions = QtWidgets.QHBoxLayout()
         self.scan_button = QtWidgets.QPushButton("扫描脑环" if kind == "eeg" else "刷新串口")
@@ -201,35 +206,57 @@ class DeviceCard(QtWidgets.QFrame):
         actions.addWidget(self.scan_button)
         actions.addWidget(self.connect_button)
         layout.addLayout(actions)
+        self.temperature_value = label("-- °C · 等待数据")
+        self.temperature_value.setStyleSheet("font-size: 19px; font-weight: 600; color: #ae632d;")
+        self.temperature_value.setVisible(kind == "temperature")
+        if kind == "temperature":
+            layout.addWidget(self.temperature_value)
         self.details = label("等待连接设备", "muted", True)
-        self.details.setMinimumHeight(38)
+        self.details.setMinimumHeight(30)
+        self.details.setStyleSheet("font-size: 11px;")
         layout.addWidget(self.details)
         self.plot = pg.PlotWidget(background="#f6fafc")
         self.plot.setFixedHeight(76)
         self.plot.setMouseEnabled(x=False, y=False)
-        self.plot.hideAxis("left")
+        if kind == "temperature":
+            self.plot.setLabel("left", "°C")
+            self.plot.getAxis("left").setWidth(44)
+            self.plot.setYRange(25, 40, padding=0)
+        else:
+            self.plot.hideAxis("left")
         self.plot.hideAxis("bottom")
         self.plot.hideButtons()
         self.plot.setMenuEnabled(False)
         self.plot.setContentsMargins(0, 0, 0, 0)
-        colors = ("#158cb0", "#42ab9d", "#8e9bce", "#d2a067") if kind == "eeg" else ("#d98670",)
+        colors = (("#158cb0", "#42ab9d", "#8e9bce", "#d2a067") if kind == "eeg"
+                  else ("#d98670",) if kind == "ppg" else ("#c38030",))
         self.curves = [self.plot.plot(pen=pg.mkPen(c, width=1)) for c in colors]
         layout.addWidget(self.plot)
-        self.hint = label("4 通道 · 500 Hz" if kind == "eeg" else "串口数据 · 自动识别采样率", "muted")
+        self.hint = label({"eeg": "4 通道 · 500 Hz", "ppg": "串口数据 · 自动识别采样率",
+                           "temperature": "蓝牙接收器 / USB · 115200 · 接触部位温度"}[kind], "muted")
         self.hint.setStyleSheet("font-size: 11px;")
         layout.addWidget(self.hint)
 
     def update_status(self, data: dict, recording: bool, busy: set[str], compact: bool = False) -> None:
         connected = bool(data.get("connected"))
-        # During a task keep both live status cards visible without compressing
-        # plots. Connection controls return automatically after an interruption.
-        show_controls = not (connected and compact)
+        enabled = bool(data.get("enabled", True))
+        show_controls = enabled and not (connected and compact)
         self.device_picker.setVisible(show_controls)
         self.scan_button.setVisible(show_controls)
         self.connect_button.setVisible(show_controls)
-        self.setMinimumHeight(290 if show_controls else 210)
-        if data.get("error"):
+        margins = (10, 7, 10, 7) if compact else (12, 10, 12, 10)
+        self.layout().setContentsMargins(*margins)
+        self.layout().setSpacing(3 if compact else 6)
+        self.plot.setFixedHeight((50 if self.kind == "temperature" else 42) if compact else 76)
+        self.plot.setVisible(enabled)
+        self.hint.setVisible(not compact)
+        self.setMinimumHeight(0)
+        if not enabled:
+            status, color, bg = "未启用", "#7b8f9e", "#edf2f5"
+        elif data.get("error"):
             status, color, bg = "连接异常", "#a44d39", "#fff0e6"
+        elif self.kind == "temperature" and connected and not data.get("streaming"):
+            status, color, bg = "等待更新", "#9b6e20", "#fff3db"
         elif recording and data.get("ready"):
             status, color, bg = "● 记录中", "#087e78", "#e1f5ef"
         elif data.get("ready"):
@@ -239,12 +266,25 @@ class DeviceCard(QtWidgets.QFrame):
         else:
             status, color, bg = "未连接", "#7b8f9e", "#edf2f5"
         self.status.setText(status)
-        self.status.setStyleSheet(f"color: {color}; background: {bg};")
+        self.status.setStyleSheet(f"color: {color}; background: {bg}; font-size: 11px; padding: 4px 7px;")
         self.connect_button.setText("断开" if connected else "连接")
-        self.connect_button.setEnabled(f"connect_{self.kind}" not in busy)
-        self.scan_button.setEnabled(f"scan_{self.kind}" not in busy and not connected)
-        self.device_picker.setEnabled(not connected and f"connect_{self.kind}" not in busy)
-        if data.get("error"):
+        self.connect_button.setEnabled(enabled and f"connect_{self.kind}" not in busy)
+        self.scan_button.setEnabled(enabled and f"scan_{self.kind}" not in busy and not connected)
+        self.device_picker.setEnabled(enabled and not connected and f"connect_{self.kind}" not in busy)
+        if not enabled:
+            text = "本次实验不采集温度"
+        elif self.kind == "temperature":
+            count = int(data.get("saved_samples") or 0)
+            age = data.get("last_age")
+            updated = f"{age:.1f} 秒前" if age is not None else "尚无数据"
+            text = f"本阶段已存 {count:,} 点 · 最近更新 {updated}"
+            if data.get("error"):
+                text += f"\n{data['error']}"
+            elif connected:
+                text += f"\n接触部位温度 · {float(data.get('rate') or 0):.2f} Hz"
+            else:
+                text += "\n请选择配套蓝牙接收器 / USB 串口"
+        elif data.get("error"):
             text = str(data["error"])
         elif connected:
             rate = float(data.get("rate") or 0)
@@ -261,6 +301,17 @@ class DeviceCard(QtWidgets.QFrame):
             text = "请连接设备，连续接收有效数据后进入实验"
         self.details.setText(text)
         self.details.setToolTip(str(data.get("identifier") or ""))
+        if self.kind == "temperature":
+            value = data.get("temperature_c")
+            valid = isinstance(value, (int, float)) and math.isfinite(value)
+            current = enabled and connected and bool(data.get("streaming")) and not data.get("error") and valid
+            self.temperature_value.setVisible(enabled)
+            self.temperature_value.setText(f"{value:.1f} °C" if current else
+                                           f"上次 {value:.1f} °C · 已过期" if valid else "-- °C · 等待有效数据")
+            self.temperature_value.setToolTip("皮肤 / 接触部位温度，模块输出分辨率 0.1 °C。")
+            self.temperature_value.setStyleSheet("font-size: 18px; font-weight: 600; color: "
+                                                + ("#956020;" if current else "#b04c36;"))
+            self.plot.setToolTip("曲线为已接收的历史温度，纵轴单位 °C，横轴为距最近样本的秒数。")
 
     def update_plot(self, data: dict) -> None:
         preview = data.get("preview") or []
@@ -268,7 +319,7 @@ class DeviceCard(QtWidgets.QFrame):
             for curve in self.curves:
                 curve.setData([], [])
             return
-        # Preview normalization is display-only; the controller saves raw values.
+        # EEG/PPG normalization is display-only; temperature keeps absolute °C.
         import numpy as np
         try:
             timestamps = np.asarray([row[0] for row in preview], dtype=float)
@@ -276,6 +327,15 @@ class DeviceCard(QtWidgets.QFrame):
             if values.ndim == 1:
                 values = values[:, None]
             timestamps -= timestamps[-1]
+            if self.kind == "temperature":
+                series = values[:, 0]
+                finite = np.isfinite(series) & np.isfinite(timestamps)
+                self.curves[0].setData(timestamps[finite], series[finite])
+                if finite.any():
+                    low, high = float(np.min(series[finite])), float(np.max(series[finite]))
+                    margin = max(.5, (high - low) * .15)
+                    self.plot.setYRange(low - margin, high + margin, padding=0)
+                return
             for index, curve in enumerate(self.curves):
                 if index >= values.shape[1]:
                     curve.setData([], [])
@@ -305,7 +365,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_state = ""
         self._last_scene_id = None
         self._last_stage_key = None
-        self.setWindowTitle("MIST · 脑环与指夹同步实验")
+        self.setWindowTitle("MIST · 脑环、指夹与温度同步实验")
         self.resize(1360, 900)
         self.setMinimumSize(1080, 750)
         self.setStyleSheet(STYLE)
@@ -313,23 +373,28 @@ class MainWindow(QtWidgets.QMainWindow):
         root.setObjectName("root")
         self.setCentralWidget(root)
         layout = QtWidgets.QVBoxLayout(root)
-        layout.setContentsMargins(25, 20, 25, 16)
-        layout.setSpacing(18)
+        layout.setContentsMargins(22, 16, 22, 12)
+        layout.setSpacing(12)
         header = QtWidgets.QHBoxLayout()
         titles = QtWidgets.QVBoxLayout()
         titles.setSpacing(4)
         titles.addWidget(label("MIST  /  PHYSIOLOGY LAB", "eyebrow"))
-        titles.addWidget(label("脑环与指夹同步实验", "title"))
+        titles.addWidget(label("脑环、指夹与温度同步实验", "title"))
         titles.addWidget(label("设备连接 → 被试信息 → 六阶段任务 → 自动保存", "subtitle"))
         header.addLayout(titles)
         header.addStretch()
+        self.temperature_enabled = QtWidgets.QCheckBox("采集温度")
+        self.temperature_enabled.setChecked(True)
+        self.temperature_enabled.setToolTip("采集 GT-M601 皮肤 / 接触部位温度；建立会话后不可更改。")
+        self.temperature_enabled.toggled.connect(self._toggle_temperature)
+        header.addWidget(self.temperature_enabled)
         self.simulation = QtWidgets.QCheckBox("模拟演示")
         self.simulation.setChecked(simulate)
         self.simulation.setToolTip("使用模拟信号演练流程，所有输出会明确标记为模拟数据")
         self.simulation.toggled.connect(self._toggle_simulation)
         header.addWidget(self.simulation)
         layout.addLayout(header)
-        self.simulation_banner = label("模拟演示模式 · 当前使用合成 EEG / PPG 信号，输出不可作为真实被试数据。", "warning", True)
+        self.simulation_banner = label("模拟演示模式 · 当前使用合成生理信号，输出不可作为真实被试数据。", "warning", True)
         layout.addWidget(self.simulation_banner)
         content = QtWidgets.QHBoxLayout()
         content.setSpacing(18)
@@ -352,14 +417,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer.start()
         self.refresh()
         self._scan("ppg")
+        if self.temperature_enabled.isChecked():
+            self._scan("temperature")
 
     def _build_setup(self, output_root: Path | None) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.gate_message = label("01  先连接右侧脑环与指夹", "sectionTitle")
+        self.gate_message = label("01  先连接右侧已启用设备", "sectionTitle")
         layout.addWidget(self.gate_message)
-        layout.addWidget(label("两台设备连续提供有效信号后，解锁被试信息。", "muted", True))
+        layout.addWidget(label("已启用设备连续提供有效信号后，解锁被试信息。无需温度时可取消顶部勾选。", "muted", True))
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         inner = QtWidgets.QWidget()
@@ -388,6 +455,11 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(label("性别 *"))
         row.addWidget(self.sex, 1)
         form.addRow("年龄 *", row)
+        self.temperature_site = QtWidgets.QLineEdit()
+        self.temperature_site.setPlaceholderText("例如：左侧前臂内侧；每次保持测量位置一致")
+        self.temperature_site.setMaxLength(120)
+        self.temperature_site_label = label("温度测量部位 *")
+        form.addRow(self.temperature_site_label, self.temperature_site)
         form.addRow("备注", self.note)
         inner_layout.addWidget(self.participant_group)
         self.config_group = QtWidgets.QGroupBox("03  实验设置")
@@ -415,7 +487,7 @@ class MainWindow(QtWidgets.QMainWindow):
         folder_row.addWidget(self.output_root, 1)
         folder_row.addWidget(button("选择文件夹", self._choose_folder))
         settings.addLayout(folder_row)
-        settings.addWidget(label("将自动创建独立被试目录；每阶段单独保存 EEG、PPG 与事件信息。", "muted", True))
+        settings.addWidget(label("将自动创建独立被试目录；每阶段单独保存 EEG、PPG、已启用的温度数据与事件信息。", "muted", True))
         inner_layout.addWidget(self.config_group)
         inner_layout.addStretch()
         scroll.setWidget(inner)
@@ -496,7 +568,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sidebar.setFixedWidth(320)
         layout = QtWidgets.QVBoxLayout(sidebar)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+        layout.setSpacing(8)
         layout.addWidget(label("实时设备状态", "sectionTitle"))
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
@@ -505,9 +577,9 @@ class MainWindow(QtWidgets.QMainWindow):
         scroll_content.setObjectName("setupContent")
         scroll_layout = QtWidgets.QVBoxLayout(scroll_content)
         scroll_layout.setContentsMargins(0, 0, 0, 0)
-        scroll_layout.setSpacing(12)
+        scroll_layout.setSpacing(6)
         self.cards: dict[str, DeviceCard] = {}
-        for kind in ("eeg", "ppg"):
+        for kind in ("eeg", "ppg", "temperature"):
             card = DeviceCard(kind)
             card.scan_button.clicked.connect(lambda checked=False, k=kind: self._scan(k))
             card.connect_button.clicked.connect(lambda checked=False, k=kind: self._connect(k))
@@ -523,8 +595,13 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(scroll, 1)
         self.abort_stage_button = button("中止当前阶段", self._abort_stage, "danger")
         self.abort_session_button = button("结束本次实验  ·  Esc", self._abort_session, "danger")
-        layout.addWidget(self.abort_stage_button)
-        layout.addWidget(self.abort_session_button)
+        self.abort_stage_button.setStyleSheet("font-size: 11px; padding: 7px 6px;")
+        self.abort_session_button.setStyleSheet("font-size: 11px; padding: 7px 6px;")
+        abort_actions = QtWidgets.QHBoxLayout()
+        abort_actions.setSpacing(6)
+        abort_actions.addWidget(self.abort_stage_button)
+        abort_actions.addWidget(self.abort_session_button)
+        layout.addLayout(abort_actions)
         return sidebar
 
     def _error(self, error: Exception | str) -> None:
@@ -571,6 +648,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh()
 
     def _scan(self, kind: str) -> None:
+        if kind == "temperature" and not self.temperature_enabled.isChecked():
+            return
         card = self.cards[kind]
         card.scan_button.setText("扫描中…" if kind == "eeg" else "刷新中…")
         controller = self.controller
@@ -593,9 +672,13 @@ class MainWindow(QtWidgets.QMainWindow):
             if not devices:
                 card.details.setText("未发现设备，请检查电源、蓝牙或 USB 连接")
 
-        self._run_async(f"scan_{kind}", controller.scan_eeg if kind == "eeg" else controller.list_ppg, done)
+        scan = {"eeg": controller.scan_eeg, "ppg": controller.list_ppg,
+                "temperature": controller.list_temperature}[kind]
+        self._run_async(f"scan_{kind}", scan, done)
 
     def _connect(self, kind: str) -> None:
+        if kind == "temperature" and not self.temperature_enabled.isChecked():
+            return
         controller = self.controller
         connected = self._snapshot.get("devices", {}).get(kind, {}).get("connected", False)
         if connected:
@@ -608,9 +691,20 @@ class MainWindow(QtWidgets.QMainWindow):
         if kind == "eeg" and (picker.currentIndex() < 0 or picker.currentText() != picker.itemText(picker.currentIndex())):
             selected = picker.currentText().strip()
         if not selected:
-            self._error("请先扫描并选择设备，或填写脑环蓝牙地址。" if kind == "eeg" else "请刷新并选择指夹串口。")
+            self._error({"eeg": "请先扫描并选择设备，或填写脑环蓝牙地址。",
+                         "ppg": "请刷新并选择指夹串口。",
+                         "temperature": "请插入 GT-M601 配套蓝牙接收器，再刷新并选择其串口。"}[kind])
             return
-        self._run_async(f"connect_{kind}", lambda: controller.connect_eeg(str(selected)) if kind == "eeg" else controller.connect_ppg(str(selected)))
+        connect = {"eeg": controller.connect_eeg, "ppg": controller.connect_ppg,
+                   "temperature": controller.connect_temperature}[kind]
+        self._run_async(f"connect_{kind}", lambda: connect(str(selected)))
+
+    def _toggle_temperature(self, checked: bool) -> None:
+        if self._snapshot.get("state", "setup") != "setup" or self._snapshot.get("session_path"):
+            self.refresh()
+            return
+        if self._call(lambda: self.controller.set_temperature_enabled(checked)) and checked:
+            self._scan("temperature")
 
     def _toggle_simulation(self, checked: bool) -> None:
         if self._snapshot.get("session_path"):
@@ -620,7 +714,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._busy.clear()
         try:
             self.controller.close()
-            self.controller = ExperimentController(simulate=checked, output_root=Path(self.output_root.text()))
+            self.controller = ExperimentController(simulate=checked, output_root=Path(self.output_root.text()),
+                                                   temperature_enabled=self.temperature_enabled.isChecked())
         except Exception as exc:
             self._error(exc)
         self.canvas.reset()
@@ -631,6 +726,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer.start()
         self.refresh()
         self._scan("ppg")
+        if self.temperature_enabled.isChecked():
+            self._scan("temperature")
         if checked:
             self._scan("eeg")
 
@@ -651,8 +748,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.output_root.text().strip():
             self._error("请选择数据保存位置。")
             return
+        if self.temperature_enabled.isChecked() and not self.temperature_site.text().strip():
+            self._error("请填写温度测量部位，例如左侧前臂内侧。")
+            self.temperature_site.setFocus()
+            return
         participant = {"id": self.subject_id.text().strip(), "age": self.age.value(),
                        "sex": self.sex.currentData(), "note": self.note.text().strip()}
+        if self.temperature_enabled.isChecked():
+            participant["temperature_site"] = self.temperature_site.text().strip()
         durations = {key: float(spin.value()) for key, spin in self.durations.items()}
         self._call(lambda: self.controller.create_session(participant, durations, Path(self.output_root.text().strip())))
 
@@ -724,16 +827,24 @@ class MainWindow(QtWidgets.QMainWindow):
         simulation = snapshot.get("mode") == "simulate"
         self.simulation_banner.setVisible(simulation)
         self.simulation.setEnabled(not snapshot.get("session_path") and not self._busy)
+        temperature_enabled = bool(snapshot.get("temperature_enabled", True))
+        blocker = QtCore.QSignalBlocker(self.temperature_enabled)
+        self.temperature_enabled.setChecked(temperature_enabled)
+        del blocker
+        self.temperature_enabled.setEnabled(state == "setup" and not snapshot.get("session_path") and not self._busy)
+        self.temperature_site.setVisible(temperature_enabled)
+        self.temperature_site_label.setVisible(temperature_enabled)
         self.pages.setCurrentIndex(0 if state == "setup" else 1)
         self.participant_group.setEnabled(ready and state == "setup")
         self.config_group.setEnabled(state == "setup")
         self.create_button.setEnabled(ready and state == "setup")
-        self.gate_message.setText("01  设备已就绪，请填写被试信息" if ready else "01  先连接右侧脑环与指夹")
+        self.gate_message.setText("01  设备已就绪，请填写被试信息" if ready else "01  先连接右侧已启用设备")
+        compact = state in ("running", "saving", "rating", "instruction")
+        self.connection_note.setVisible(not compact)
         now = time.monotonic()
         for kind, card in self.cards.items():
             data = snapshot.get("devices", {}).get(kind, {})
-            card.update_status(data, state == "running", self._busy,
-                               compact=state in ("running", "saving", "rating", "instruction"))
+            card.update_status(data, state == "running", self._busy, compact=compact)
             if f"scan_{kind}" not in self._busy:
                 card.scan_button.setText("扫描脑环" if kind == "eeg" else "刷新串口")
             if now - self._last_plot >= .1:
@@ -824,7 +935,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 def main(args: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="MIST 脑环与指夹同步实验")
+    parser = argparse.ArgumentParser(description="MIST 脑环、指夹与温度同步实验")
     parser.add_argument("--simulate", action="store_true", help="使用明确标记的模拟数据演示实验")
     parser.add_argument("--output", type=Path, default=None, help="被试数据保存根目录")
     parser.add_argument("--self-test", type=Path, default=None, metavar="DIRECTORY",

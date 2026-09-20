@@ -72,12 +72,16 @@ def run_self_test(app: QtWidgets.QApplication, output: Path, hidden: bool = Fals
         counts = {}
         for stage in DEFAULT_STAGES:
             counts[stage.key] = {}
-            for device in ("eeg", "ppg"):
+            for device in ("eeg", "ppg", "temperature"):
                 matches = list(session.rglob(f"{stage.key}_{device}.csv"))
                 if len(matches) != 1:
                     raise AssertionError(f"Expected one {stage.key} {device} sample file")
                 with matches[0].open(encoding="utf-8-sig", newline="") as handle:
-                    count = sum(1 for _ in csv.DictReader(handle))
+                    records = list(csv.DictReader(handle))
+                    count = len(records)
+                if device == "temperature":
+                    if not all(30 <= float(row["temperature_c"]) <= 40 for row in records):
+                        raise AssertionError("Unexpected simulated temperature value")
                 if count < 1:
                     raise AssertionError(f"No saved samples for {stage.key} {device}")
                 counts[stage.key][device] = count
@@ -108,8 +112,11 @@ def run_self_test(app: QtWidgets.QApplication, output: Path, hidden: bool = Fals
                 window.age.setValue(20)
                 window.sex.setCurrentIndex(window.sex.findData("unspecified"))
                 window.note.setText("Automated simulation acceptance check; no physical devices")
+                window.temperature_site.setText("左前臂皮肤（模拟）")
                 for spin in window.durations.values():
-                    spin.setValue(1)
+                    # A low-frequency temperature stream needs more than one
+                    # period to guarantee a sample despite scheduler jitter.
+                    spin.setValue(2)
                 window._create_session()
                 report["checks"]["readiness_gate_passed"] = True
             elif state == "instruction":
@@ -158,6 +165,7 @@ def run_self_test(app: QtWidgets.QApplication, output: Path, hidden: bool = Fals
         window.show()
         window.controller.connect_eeg("SIM-EEG")
         window.controller.connect_ppg("SIM-PPG")
+        window.controller.connect_temperature("SIM-TEMPERATURE")
         timer.setInterval(40)
         timer.timeout.connect(step)
         timer.start()

@@ -6,7 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from mist_app.devices import EEGDevice, PPGDevice, PPGParser, SimulatedDevice, parse_eeg_packet
+from mist_app.devices import (
+    EEGDevice, PPGDevice, PPGParser, SimulatedDevice, TemperatureDevice,
+    TemperatureParser, list_temperature, parse_eeg_packet,
+)
 from mist_app.devices.protocol import EEG_NOTIFY_UUID, EEG_SERVICE_UUID, EEG_WRITE_UUID
 from mist_app.models import EEG_UV_PER_COUNT
 
@@ -72,7 +75,7 @@ def test_ppg_oversized_line_is_discarded_until_newline_without_prefix_sample():
     assert parser.feed(b"123\n42\n", 1).samples == ((42,),)
 
 
-@pytest.mark.parametrize("device,expected_count", [("eeg", 8), ("ppg", 1)])
+@pytest.mark.parametrize("device,expected_count", [("eeg", 8), ("ppg", 1), ("temperature", 1)])
 def test_simulation_worker_lifecycle_and_real_protocol(device, expected_count):
     messages = []
     arrived = threading.Event()
@@ -116,12 +119,17 @@ def test_simulation_rejects_concurrent_connect():
         adapter.disconnect()
 
 
-def test_serial_reader_preserves_chunks_and_reports_unexpected_loss(monkeypatch):
+@pytest.mark.parametrize("device_type,baud_rate,chunks_data,sample", [
+    (PPGDevice, 57600, [b"boot\r\n1", b"23\n"], 123),
+    (TemperatureDevice, 115200, [b"boot\r\nA+3", b"6.5B\r\n"], 36.5),
+])
+def test_serial_reader_preserves_chunks_and_reports_unexpected_loss(monkeypatch, device_type, baud_rate,
+                                                                  chunks_data, sample):
     import serial
 
     messages = []
     ended = threading.Event()
-    chunks = iter([b"boot\r\n1", b"23\n"])
+    chunks = iter(chunks_data)
 
     class FakePort:
         closed = False
@@ -140,7 +148,10 @@ def test_serial_reader_preserves_chunks_and_reports_unexpected_loss(monkeypatch)
 
     def open_serial(identifier, **kwargs):
         assert identifier == "COM_TEST"
-        assert kwargs["baudrate"] == 57600
+        assert kwargs["baudrate"] == baud_rate
+        assert kwargs["bytesize"] == serial.EIGHTBITS
+        assert kwargs["parity"] == serial.PARITY_NONE
+        assert kwargs["stopbits"] == serial.STOPBITS_ONE
         assert kwargs["timeout"] == 0.1
         return port
 
@@ -150,16 +161,16 @@ def test_serial_reader_preserves_chunks_and_reports_unexpected_loss(monkeypatch)
             ended.set()
 
     monkeypatch.setattr(serial, "Serial", open_serial)
-    adapter = PPGDevice(receive)
+    adapter = device_type(receive)
     adapter.connect("COM_TEST")
     assert ended.wait(2)
     adapter.disconnect()
     assert port.closed
     assert not adapter.connected
     assert [m.kind for m in messages] == ["connected", "packet", "packet", "error", "disconnected"]
-    assert messages[1].raw == b"boot\r\n1"
+    assert messages[1].raw == chunks_data[0]
     assert messages[1].samples == ()
-    assert messages[2].samples == ((123,),)
+    assert messages[2].samples == ((sample,),)
     assert messages[1].received_ns <= messages[2].received_ns
 
 
@@ -263,7 +274,8 @@ def test_ble_rejects_wrong_device_and_closes_connection(monkeypatch):
     adapter.disconnect()
 
 
-def test_serial_with_no_data_remains_cancellable_and_does_not_invent_samples(monkeypatch):
+@pytest.mark.parametrize("device_type", [PPGDevice, TemperatureDevice])
+def test_serial_with_no_data_remains_cancellable_and_does_not_invent_samples(monkeypatch, device_type):
     import serial
 
     messages = []
@@ -293,7 +305,7 @@ def test_serial_with_no_data_remains_cancellable_and_does_not_invent_samples(mon
         if message.kind == "connected":
             ready.set()
 
-    adapter = PPGDevice(receive)
+    adapter = device_type(receive)
     adapter.connect("COM_TEST")
     assert ready.wait(2)
     started = time.perf_counter()
@@ -302,3 +314,124 @@ def test_serial_with_no_data_remains_cancellable_and_does_not_invent_samples(mon
     assert cancelled.is_set()
     assert port.closed
     assert [m.kind for m in messages] == ["connected", "disconnected"]
+
+
+@pytest.mark.parametrize("split", range(1, 9))
+def test_temperature_partial_frame_at_every_boundary_and_coalesced_frames(split):
+    raw = b"A+36.5B\r\n"
+    parser = TemperatureParser()
+    first = parser.feed(raw[:split], 100)
+    assert first.samples == ()
+    assert first.raw == raw[:split]
+    assert not first.error
+    second = parser.feed(raw[split:] + b"A-05.2B\r\nA+00.0B\r\nA+3", 200)
+    assert second.device == "temperature"
+    assert second.samples == ((36.5,), (-5.2,), (0.0,))
+    assert all(isinstance(row[0], float) for row in second.samples)
+    assert second.received_ns == 200
+    assert second.meta["buffered_bytes"] == 3
+    assert second.meta["resolution_celsius"] == 0.1
+    assert second.meta["baud_rate"] == 115200
+    assert second.meta["protocol"] == "gt-m601-ascii"
+    assert "nominal_rate_hz" not in second.meta
+    assert not second.error
+    assert parser.feed(b"7.1B\r\n", 300).samples == ((37.1,),)
+
+
+@pytest.mark.parametrize("invalid", [
+    b"36.5\r\n", b"A36.5B\r\n", b"A+3.5B\r\n", b"A+036.5B\r\n",
+    b"A+36.50B\r\n", b"A+36.5B\n", b" A+36.5B\r\n", b"A+36.5B \r\n",
+    b"A+36.5C\r\n", b"A+NaNB\r\n", b"\xffA+36.5B\r\n", b"A-70.1B\r\n",
+    b"A-99.9B\r\n", b"A+36.5BA+37.5B\r\n", b"\r\n",
+])
+def test_temperature_invalid_frames_retained_and_resynchronized(invalid):
+    raw = invalid + b"A+36.5B\r\n"
+    message = TemperatureParser().feed(raw, 12)
+    assert message.raw == raw
+    assert message.samples == ((36.5,),)
+    assert message.meta["parse_errors"] == 1
+    assert len(message.meta["parse_error_details"]) == 1
+    assert message.error
+
+
+def test_temperature_documented_format_limits():
+    message = TemperatureParser().feed(b"A-70.0B\r\nA+99.9B\r\nA+100.0B\r\n", 0)
+    assert message.samples == ((-70.0,), (99.9,))
+    assert message.meta["parse_errors"] == 1
+
+
+def test_temperature_oversized_unterminated_data_is_bounded_and_never_decodes_suffix():
+    parser = TemperatureParser(max_line_bytes=8)
+    message = parser.feed(b"x" * 10000, 0)
+    assert message.samples == ()
+    assert message.meta["parse_errors"] == 1
+    assert message.meta["buffered_bytes"] == 0
+    assert message.meta["discarding_oversized_line"] is True
+    recovered = parser.feed(b"A+36.5B\r\nA+37.0B\r\n", 1)
+    assert recovered.samples == ((37.0,),)
+    assert not recovered.error
+
+
+def test_temperature_serial_port_candidates_are_not_assumed_to_be_sensors(monkeypatch):
+    from serial.tools import list_ports
+
+    ports = [
+        SimpleNamespace(device="COM8", description="Bluetooth receiver", vid=None),
+        SimpleNamespace(device="COM5", description="USB-SERIAL CH340", vid=0x1A86),
+        SimpleNamespace(device="COM2", description="", vid=0x1234),
+    ]
+    monkeypatch.setattr(list_ports, "comports", lambda: ports)
+    assert list_temperature() == [
+        {"device": "COM2", "description": "COM2"},
+        {"device": "COM5", "description": "USB-SERIAL CH340"},
+        {"device": "COM8", "description": "Bluetooth receiver"},
+    ]
+
+
+def test_temperature_reconnect_does_not_reuse_partial_frame(monkeypatch):
+    import serial
+
+    messages = []
+    ended = threading.Event()
+    ports = []
+
+    class FakePort:
+        in_waiting = 32
+        closed = False
+
+        def __init__(self, chunks):
+            self.chunks = iter(chunks)
+
+        def read(self, _size):
+            try:
+                return next(self.chunks)
+            except StopIteration:
+                raise serial.SerialException("USB unplugged")
+
+        def close(self):
+            self.closed = True
+
+    streams = iter([[b"A+3"], [b"6.5B\r\nA+37.0B\r\n"]])
+
+    def open_serial(*_args, **_kwargs):
+        port = FakePort(next(streams))
+        ports.append(port)
+        return port
+
+    def receive(message):
+        messages.append(message)
+        if message.kind == "disconnected":
+            ended.set()
+
+    monkeypatch.setattr(serial, "Serial", open_serial)
+    adapter = TemperatureDevice(receive)
+    for _ in range(2):
+        ended.clear()
+        adapter.connect("COM_TEST")
+        assert ended.wait(2)
+        adapter.disconnect()
+    packets = [message for message in messages if message.kind == "packet"]
+    assert packets[0].samples == ()
+    assert packets[1].samples == ((37.0,),)
+    assert packets[1].meta["parse_errors"] == 1
+    assert all(port.closed for port in ports)

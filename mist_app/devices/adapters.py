@@ -12,7 +12,10 @@ import time
 from typing import Any
 
 from mist_app.models import DeviceCallback, DeviceMessage
-from .protocol import EEG_NOTIFY_UUID, EEG_SERVICE_UUID, EEG_WRITE_UUID, PPGParser, parse_eeg_packet
+from .protocol import (
+    EEG_NOTIFY_UUID, EEG_SERVICE_UUID, EEG_WRITE_UUID, PPGParser,
+    TEMPERATURE_BAUD_RATE, TEMPERATURE_PROTOCOL, TemperatureParser, parse_eeg_packet,
+)
 
 log = logging.getLogger(__name__)
 
@@ -48,12 +51,25 @@ def scan_eeg(timeout: float = 5.0) -> list[dict[str, str]]:
     return asyncio.run(scan())
 
 
-def list_ppg() -> list[dict[str, str]]:
+def _list_serial_ports() -> list[dict[str, str]]:
     from serial.tools import list_ports
     ports = list(list_ports.comports())
     ports.sort(key=lambda port: (port.vid is None, port.device))
     return [{"device": port.device, "description": port.description or port.device}
             for port in ports]
+
+
+def list_ppg() -> list[dict[str, str]]:
+    return _list_serial_ports()
+
+
+def list_temperature() -> list[dict[str, str]]:
+    """List candidates for both USB serial and the supplied Bluetooth receiver.
+
+    CH340 is not unique to GT-M601; never identify the sensor by chipset alone.
+    Its documented frames are verified only after opening the selected port.
+    """
+    return _list_serial_ports()
 
 
 class _ThreadedDevice:
@@ -217,8 +233,10 @@ class EEGDevice(_ThreadedDevice):
                 log.debug("BLE disconnection cleanup failed", exc_info=True)
 
 
-class PPGDevice(_ThreadedDevice):
-    device = "ppg"
+class _SerialDevice(_ThreadedDevice):
+    baud_rate: int
+    parser_type: type[PPGParser] | type[TemperatureParser]
+    connection_meta: dict[str, Any] = {}
 
     def __init__(self, callback: DeviceCallback):
         super().__init__(callback)
@@ -235,16 +253,18 @@ class PPGDevice(_ThreadedDevice):
     def _acquire(self) -> None:
         import serial
 
-        parser = PPGParser()
-        # Arduino may reset when the port opens. Startup lines remain diagnostics;
-        # the readiness gate waits for continuous valid samples afterwards.
-        port = serial.Serial(self.identifier, baudrate=57600, timeout=0.1, write_timeout=0.5)
+        # A reconnect starts a new parser: an unfinished frame from an earlier
+        # connection must never be joined to data from the new connection.
+        parser = self.parser_type()
+        port = serial.Serial(self.identifier, baudrate=self.baud_rate,
+                             bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
+                             stopbits=serial.STOPBITS_ONE, timeout=0.1, write_timeout=0.5)
         self._serial = port
         try:
             if self._stop.is_set():
                 return
             self.connected = True
-            self._status("connected", baud_rate=57600)
+            self._status("connected", baud_rate=self.baud_rate, **self.connection_meta)
             while not self._stop.is_set():
                 raw = port.read(min(max(port.in_waiting, 1), 4096))
                 received_ns = time.perf_counter_ns()
@@ -255,12 +275,34 @@ class PPGDevice(_ThreadedDevice):
             port.close()
 
 
+class PPGDevice(_SerialDevice):
+    # Arduino may reset when the port opens. Startup lines remain diagnostics;
+    # the readiness gate waits for continuous valid samples afterwards.
+    device = "ppg"
+    baud_rate = 57600
+    parser_type = PPGParser
+
+
+class TemperatureDevice(_SerialDevice):
+    """GT-M601 USB serial or its factory-paired Bluetooth USB receiver.
+
+    The manufacturer documents a COM port for both kits, with automatic
+    streaming at 115200 8N1. No BLE UUID or start/stop commands are specified.
+    """
+
+    device = "temperature"
+    baud_rate = TEMPERATURE_BAUD_RATE
+    parser_type = TemperatureParser
+    connection_meta = {"protocol": TEMPERATURE_PROTOCOL, "unit": "celsius",
+                       "resolution_celsius": 0.1, "transport": "serial"}
+
+
 class SimulatedDevice(_ThreadedDevice):
     """Protocol-realistic synthetic data, explicitly tagged at every callback."""
 
     def __init__(self, device: str, callback: DeviceCallback):
-        if device not in ("eeg", "ppg"):
-            raise ValueError("device must be eeg or ppg")
+        if device not in ("eeg", "ppg", "temperature"):
+            raise ValueError("device must be eeg, ppg or temperature")
         self.device = device
         super().__init__(callback)
 
@@ -269,11 +311,11 @@ class SimulatedDevice(_ThreadedDevice):
 
     def _acquire(self) -> None:
         self.connected = True
-        self._status("connected", nominal_rate_hz=500 if self.device == "eeg" else 125)
-        parser = PPGParser()
-        rng = random.Random(101 if self.device == "eeg" else 102)
+        self._status("connected", nominal_rate_hz={"eeg": 500, "ppg": 125, "temperature": 1}[self.device])
+        parser = TemperatureParser() if self.device == "temperature" else PPGParser()
+        rng = random.Random({"eeg": 101, "ppg": 102, "temperature": 103}[self.device])
         index = 0
-        interval = 0.016 if self.device == "eeg" else 0.008
+        interval = {"eeg": 0.016, "ppg": 0.008, "temperature": 1.0}[self.device]
         deadline = time.perf_counter()
         while not self._stop.is_set():
             if self.device == "eeg":
@@ -285,10 +327,14 @@ class SimulatedDevice(_ThreadedDevice):
                         raw.extend(count.to_bytes(3, "big", signed=True))
                 index += 8
                 self._emit(parse_eeg_packet(bytes(raw), time.perf_counter_ns()))
-            else:
+            elif self.device == "ppg":
                 value = round(100000 + 8000 * math.sin(2 * math.pi * 1.2 * index / 125) + rng.gauss(0, 100))
                 index += 1
                 self._emit(parser.feed(f"{value}\r\n".encode("ascii"), time.perf_counter_ns()))
+            else:
+                value = 33.0 + 0.3 * math.sin(2 * math.pi * index / 120) + rng.gauss(0, 0.03)
+                index += 1
+                self._emit(parser.feed(f"A{value:+05.1f}B\r\n".encode("ascii"), time.perf_counter_ns()))
             deadline += interval
             now = time.perf_counter()
             # Avoid unbounded catch-up bursts after suspension or debugging.
