@@ -127,9 +127,20 @@ class SessionRecorder:
         root.mkdir(parents=True, exist_ok=True)
         if shutil.disk_usage(root).free < 100 * 1024**2:
             raise OSError("保存磁盘剩余空间不足 100 MB。")
-        stem = f"{safe_id(str(participant['id']))}_{datetime.now():%Y%m%d_%H%M%S_%f}"
-        self.path = root / stem
-        self.path.mkdir(exist_ok=False)
+        sex = str(participant.get("sex", participant.get("gender", ""))).strip()
+        sex_label = {"female": "女", "male": "男", "unspecified": "其他", "other": "其他",
+                     "其他 / 不愿透露": "其他"}.get(sex, sex)
+        stem = f"{safe_id(str(participant['id']))}_{safe_id(sex_label)}_{datetime.now():%Y%m%d_%H%M%S_%f}"
+        number = 1
+        while True:
+            self.path = root / (stem if number == 1 else f"{stem}_{number:02d}")
+            try:
+                # Reserve the directory atomically, including simultaneous starts
+                # in different program instances. Never reuse an existing folder.
+                self.path.mkdir(exist_ok=False)
+                break
+            except FileExistsError:
+                number += 1
         self.session_id = uuid.uuid4().hex
         self.error = ""
         self._error_lock = threading.Lock()

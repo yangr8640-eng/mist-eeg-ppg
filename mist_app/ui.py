@@ -429,6 +429,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(label("已启用设备连续提供有效信号后，解锁被试信息。无需温度时可取消顶部勾选。", "muted", True))
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
+        self.setup_scroll = scroll
         inner = QtWidgets.QWidget()
         inner.setObjectName("setupContent")
         inner_layout = QtWidgets.QVBoxLayout(inner)
@@ -561,6 +562,9 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.session_path_label)
         self.open_folder_button = button("打开数据文件夹", self._open_folder)
         layout.addWidget(self.open_folder_button)
+        self.restart_button = button("再次实验", self._restart_experiment, "primary")
+        self.restart_button.setToolTip("返回设备连接与被试信息页，开始一次新的实验。已保存的数据会保留。")
+        layout.addWidget(self.restart_button)
         return page
 
     def _build_sidebar(self) -> QtWidgets.QWidget:
@@ -648,6 +652,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh()
 
     def _scan(self, kind: str) -> None:
+        if "restart" in self._busy:
+            return
         if kind == "temperature" and not self.temperature_enabled.isChecked():
             return
         card = self.cards[kind]
@@ -677,6 +683,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_async(f"scan_{kind}", scan, done)
 
     def _connect(self, kind: str) -> None:
+        if "restart" in self._busy:
+            return
         if kind == "temperature" and not self.temperature_enabled.isChecked():
             return
         controller = self.controller
@@ -735,6 +743,58 @@ class MainWindow(QtWidgets.QMainWindow):
         chosen = QtWidgets.QFileDialog.getExistingDirectory(self, "选择保存位置", self.output_root.text())
         if chosen:
             self.output_root.setText(chosen)
+
+    def _restart_experiment(self) -> None:
+        snapshot = self.controller.snapshot()
+        if (self._closed or self._busy or snapshot.get("saving")
+                or snapshot.get("state") not in ("completed", "aborted")):
+            return
+        controller = self.controller
+        simulate = snapshot.get("mode") == "simulate"
+        temperature_enabled = bool(snapshot.get("temperature_enabled", True))
+        output_root = Path(self.output_root.text().strip())
+        # Ignore queued results from the previous experiment. Device shutdown and
+        # writer draining can take seconds, so leave the Qt event loop running.
+        self._generation += 1
+
+        def done(_: Any) -> None:
+            try:
+                closed_snapshot = controller.snapshot()
+                if closed_snapshot.get("state") == "error":
+                    raise RuntimeError(closed_snapshot.get("last_error") or "记录发生错误，请先检查已保存文件。")
+                replacement = ExperimentController(simulate=simulate, output_root=output_root,
+                                                   temperature_enabled=temperature_enabled)
+            except Exception as exc:
+                self._error(exc)
+                return
+            self.controller = replacement
+            self.subject_id.clear()
+            self.age.setValue(25)
+            self.sex.setCurrentIndex(0)
+            self.note.clear()
+            self.temperature_site.clear()
+            self.answer.clear()
+            self._rating_touched = False
+            self.rating_slider.setValue(50)
+            self.rating_button.setEnabled(False)
+            self.rating_label.setText("请拖动滑块，选择你此刻的压力程度")
+            self.canvas.reset()
+            self._last_state = ""
+            self._last_scene_id = None
+            self._last_stage_key = None
+            self._last_plot = 0.0
+            self.setup_scroll.verticalScrollBar().setValue(0)
+            for card in self.cards.values():
+                card.device_picker.clear()
+            self.refresh()
+            self._scan("ppg")
+            if temperature_enabled:
+                self._scan("temperature")
+            if simulate:
+                self._scan("eeg")
+
+        self._run_async("restart", controller.close, done)
+        self.refresh()
 
     def _create_session(self) -> None:
         if not self.subject_id.text().strip():
@@ -825,6 +885,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ready = bool(snapshot.get("ready"))
         scene = dict(snapshot.get("scene") or {})
         simulation = snapshot.get("mode") == "simulate"
+        restarting = "restart" in self._busy
         self.simulation_banner.setVisible(simulation)
         self.simulation.setEnabled(not snapshot.get("session_path") and not self._busy)
         temperature_enabled = bool(snapshot.get("temperature_enabled", True))
@@ -845,6 +906,10 @@ class MainWindow(QtWidgets.QMainWindow):
         for kind, card in self.cards.items():
             data = snapshot.get("devices", {}).get(kind, {})
             card.update_status(data, state == "running", self._busy, compact=compact)
+            if restarting:
+                card.device_picker.setEnabled(False)
+                card.scan_button.setEnabled(False)
+                card.connect_button.setEnabled(False)
             if f"scan_{kind}" not in self._busy:
                 card.scan_button.setText("扫描脑环" if kind == "eeg" else "刷新串口")
             if now - self._last_plot >= .1:
@@ -905,6 +970,9 @@ class MainWindow(QtWidgets.QMainWindow):
         path = snapshot.get("session_path") or ""
         self.session_path_label.setText(f"本次数据：{path}" if path else "")
         self.open_folder_button.setVisible(bool(path) and state in ("completed", "aborted", "error"))
+        self.restart_button.setVisible(state in ("completed", "aborted"))
+        self.restart_button.setEnabled(not self._busy and not snapshot.get("saving"))
+        self.restart_button.setText("正在准备新实验…" if restarting else "再次实验")
         if (self._last_stage_key == "eyes_closed" and self._last_state in ("running", "saving")
                 and state in ("rating", "interrupted", "error", "aborted")):
             if hasattr(self.controller, "mark_audio_requested"):
@@ -914,6 +982,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_state = state
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if "restart" in self._busy:
+            # The worker owns controller.close() until its completion signal.
+            event.ignore()
+            return
         if self._closed:
             event.accept()
             return

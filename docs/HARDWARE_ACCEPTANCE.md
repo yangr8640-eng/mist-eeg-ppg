@@ -4,7 +4,7 @@
 
 验收来源是项目使用者的实机测试反馈。本记录未附逐项数据审查、量程校准、温度绝对精度、毫秒级硬件同步或全部断线故障注入的测试证据，不将这些项目列为已验证。
 
-本次保留使用者已跑通的 v0.2.0 EXE，仅更新文档、Release 状态及运行包内文档。该 EXE 生成的 `hardware_acceptance: not_verified` 是构建时固定默认字段，不会动态反映本次人工验收；判断当前实机功能验收状态应引用本记录。`build-validation.json` 中的 `hardware_tested: false` 属于模拟自检报告，保留其原义，与本次人工实机验收是不同来源的证据。
+2026-09-20 的验收记录更新保留当时已跑通的 v0.2.0 EXE，仅更新文档、Release 状态及运行包内文档。后续 v0.2.3 增加再次实验及新目录命名，已通过软件回归与连续两次模拟实验自检，真实设备连续采集尚待复验。EXE 生成的 `hardware_acceptance: not_verified` 是构建时固定默认字段，不会动态反映人工验收；`build-validation.json` 中的 `hardware_tested: false` 属于模拟自检报告，与人工实机验收是不同来源的证据。
 
 以下步骤供以后更换设备、电脑、固件或升级程序时复验使用，也可用于补充研究所需的专项测试；它们不是本次已逐项执行的测试清单。
 
@@ -72,10 +72,10 @@ EEG 理想 180 秒约 90,000 行，每行包含四通道；由于按整包接收
 
 ## 开发者软件自检（无需设备）
 
-以下命令强制使用模拟设备，不扫描或访问真实硬件。它通过真实 Qt 绘制完成六个 2 秒阶段、三路采集、作答、评分和保存；模拟温度按 1 Hz 更新，2 秒窗口用于覆盖低频数据。此命令用于软件回归，不属于被试实验操作。
+以下命令强制使用模拟设备，不扫描或访问真实硬件。它通过真实 Qt 绘制在同一个窗口连续完成两次实验，每次包括六个 2 秒阶段、三路采集、作答、评分和保存；模拟温度按 1 Hz 更新，2 秒窗口用于覆盖低频数据。此命令用于软件回归，不属于被试实验操作。
 
 ```powershell
 python -m mist_app --self-test C:\Temp\mist-check --self-test-hidden
 ```
 
-打包 EXE 可使用同样参数。检查输出目录的 `self_test_report.json` 是否通过，并检查 `01_setup.png`、`02_question.png`、`03_completed.png`。模拟会话仍在 `SIMULATED` 目录中，不能当作实物验收记录。
+打包 EXE 可使用同样参数。检查输出目录的 `self_test_report.json` 是否通过，并检查 `01_setup.png`、`02_question.png`、`03_completed.png`、`04_restart_setup.png` 和 `07_repeat_completed.png`。模拟会话仍在 `SIMULATED` 目录中，不能当作实物验收记录。

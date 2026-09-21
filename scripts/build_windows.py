@@ -59,6 +59,8 @@ def main():
         # Publish reproducible checks, without embedding a local username/path.
         report.pop("session_path", None)
         report.pop("screenshots", None)
+        for session in report.get("sessions", []):
+            session.pop("session_path", None)
         (output / "build-validation.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     archive = shutil.make_archive(str(root / "dist" / "MIST-EEG-PPG-Windows-x64"), "zip", output.parent, output.name)
     print(archive)

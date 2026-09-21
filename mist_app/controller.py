@@ -193,7 +193,7 @@ class ExperimentController:
             raise ValueError("请先选择设备或填写连接地址。")
         with self._lock:
             if self.state in ("running", "saving", "completed", "aborted", "error"):
-                raise RuntimeError("当前状态不能重新连接；请等待阶段结束或重新打开程序。")
+                raise RuntimeError("当前状态不能重新连接；实验完成或结束后可点击“再次实验”返回设备连接页。")
             if device not in self.enabled_devices:
                 raise RuntimeError("请先启用温度采集。")
             if device in self._connecting or self._health[device].connected:
@@ -227,7 +227,7 @@ class ExperimentController:
     def create_session(self, participant, durations, output_root=None):
         with self._lock:
             if self.state != "setup" or self.recorder:
-                raise RuntimeError("已经建立会话；请完成或退出后重新开始。")
+                raise RuntimeError("已经建立会话；请完成或结束本次实验，再点击“再次实验”。")
             if not self._ready(time.perf_counter_ns()):
                 raise RuntimeError("所有已启用设备均需连续收到有效数据至少 3 秒。")
             participant = dict(participant)
@@ -583,6 +583,12 @@ class ExperimentController:
         self.abort_session()
         for adapter in self._devices.values():
             adapter.disconnect()
+        # disconnect() bounds the initial wait; BLE cleanup can outlive it.
+        # A subsequent experiment must not race the old transport teardown.
+        for device, adapter in self._devices.items():
+            if not adapter.wait_disconnected():
+                name = {"eeg": "脑环", "ppg": "指夹", "temperature": "温度传感器"}[device]
+                raise RuntimeError(f"{name} 尚未完全断开，请稍候再试。")
         deadline = time.monotonic() + 10
         while self.state == "saving" and time.monotonic() < deadline:
             with self._lock:
@@ -590,6 +596,10 @@ class ExperimentController:
             time.sleep(.01)
         self._stop.set()
         self._thread.join(timeout=2)
+        if self._thread.is_alive():
+            raise RuntimeError("实验控制线程尚未退出，请稍候再试。")
         if self.recorder:
             self.recorder.shutdown()
+            if self.recorder._thread.is_alive():
+                raise RuntimeError("文件仍在保存，请稍候再试。")
         self._closed = True

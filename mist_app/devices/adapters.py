@@ -103,6 +103,13 @@ class _ThreadedDevice:
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=0.75)
 
+    def wait_disconnected(self, timeout: float = 5.0) -> bool:
+        """Wait for transport cleanup before a new controller reuses the device."""
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+        return thread is None or not thread.is_alive()
+
     def _request_stop(self) -> None:
         pass
 

@@ -5,7 +5,10 @@ import csv
 import json
 import queue
 import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -34,6 +37,157 @@ def ppg(at, value=42):
 
 def temperature(at, value=36.25):
     return DeviceMessage("temperature", "packet", at, f"{value}\r\n".encode(), ((value,),))
+
+
+@pytest.fixture
+def frozen_session_datetime(monkeypatch):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 21, 23, 59, 59, 123456, tzinfo=tz)
+
+    monkeypatch.setattr("mist_app.storage.datetime", FrozenDateTime)
+
+
+@pytest.mark.parametrize("simulate", [False, True])
+@pytest.mark.parametrize("participant_sex, expected_sex", [
+    ({"sex": "male"}, "男"),
+    ({"sex": "female"}, "女"),
+    ({"sex": "unspecified"}, "其他"),
+    ({"sex": "other"}, "其他"),
+    ({"sex": "男"}, "男"),
+    ({"sex": "女"}, "女"),
+    ({"sex": "其他"}, "其他"),
+    ({"sex": "其他 / 不愿透露"}, "其他"),
+    ({"gender": "female"}, "女"),
+])
+def test_session_directory_uses_participant_sex_and_local_datetime(
+        tmp_path, frozen_session_datetime, participant_sex, expected_sex, simulate):
+    participant = {"id": "P001", "age": 25, **participant_sex}
+    recorder = SessionRecorder(tmp_path, participant, [], simulate, SessionClock())
+    try:
+        parent = tmp_path / "SIMULATED" if simulate else tmp_path
+        assert recorder.path == parent / f"P001_{expected_sex}_20260921_235959_123456"
+        manifest = read_json(recorder.path / "session.json")
+        assert manifest["participant"] == participant
+        assert manifest["mode"] == ("simulate" if simulate else "hardware")
+    finally:
+        recorder.shutdown()
+
+
+def test_session_directory_pads_time_and_preserves_six_microsecond_digits(tmp_path, monkeypatch):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 21, 1, 2, 3, 4, tzinfo=tz)
+
+    monkeypatch.setattr("mist_app.storage.datetime", FrozenDateTime)
+    recorder = make_recorder(tmp_path)
+    try:
+        assert recorder.path.name == "P001_其他_20260921_010203_000004"
+    finally:
+        recorder.shutdown()
+
+
+def test_same_timestamp_repeated_sessions_preserve_all_previous_files(tmp_path, frozen_session_datetime):
+    sessions = []
+    snapshots = []
+    for number in range(1, 4):
+        recorder = make_recorder(tmp_path)
+        try:
+            stage = recorder.prepare(Stage("eyes_open", "睁眼静息", 1), 1)
+            stage.start_ns, stage.end_ns, stage.status = 100, 200, "completed"
+            assert recorder.packet(ppg(150, number), 1)
+            assert recorder.finish_stage(stage).wait(3)
+            assert recorder.finish("completed").wait(3)
+            assert not recorder.error
+        finally:
+            recorder.shutdown()
+        suffix = "" if number == 1 else f"_{number:02d}"
+        assert recorder.path.name == f"P001_其他_20260921_235959_123456{suffix}"
+        assert read_csv(stage.path / "eyes_open_ppg.csv")[0]["red"] == str(number)
+        sessions.append(recorder)
+        snapshots.append({p.relative_to(recorder.path): p.read_bytes()
+                          for p in recorder.path.rglob("*") if p.is_file()})
+        for previous, snapshot in zip(sessions, snapshots):
+            assert {p.relative_to(previous.path): p.read_bytes()
+                    for p in previous.path.rglob("*") if p.is_file()} == snapshot
+    assert len({recorder.session_id for recorder in sessions}) == 3
+    assert len({read_json(recorder.path / "session.json")["session_id"]
+                for recorder in sessions}) == 3
+
+
+def test_concurrent_sessions_claim_distinct_directories_atomically(
+        tmp_path, frozen_session_datetime, monkeypatch):
+    base = tmp_path / "SIMULATED" / "P001_其他_20260921_235959_123456"
+    contenders = Barrier(4)
+    original_mkdir = Path.mkdir
+
+    def synchronized_mkdir(path, *args, **kwargs):
+        if path == base:
+            contenders.wait(timeout=5)
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", synchronized_mkdir)
+
+    def record(value):
+        recorder = make_recorder(tmp_path)
+        try:
+            stage = recorder.prepare(Stage("eyes_open", "睁眼静息", 1), 1)
+            stage.start_ns, stage.end_ns, stage.status = 100, 200, "completed"
+            assert recorder.packet(ppg(150, value), 1)
+            assert recorder.finish_stage(stage).wait(3)
+            assert recorder.finish("completed").wait(3)
+            assert not recorder.error
+        finally:
+            recorder.shutdown()
+        return recorder, stage, value
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(record, range(1, 5)))
+    assert {recorder.path.name for recorder, _, _ in results} == {
+        "P001_其他_20260921_235959_123456", "P001_其他_20260921_235959_123456_02",
+        "P001_其他_20260921_235959_123456_03", "P001_其他_20260921_235959_123456_04",
+    }
+    assert len({recorder.session_id for recorder, _, _ in results}) == 4
+    for recorder, stage, value in results:
+        assert read_json(recorder.path / "session.json")["session_id"] == recorder.session_id
+        assert [row["red"] for row in read_csv(stage.path / "eyes_open_ppg.csv")] == [str(value)]
+
+
+def test_session_directory_skips_existing_directories_and_files(tmp_path, frozen_session_datetime):
+    base = tmp_path / "SIMULATED" / "P001_其他_20260921_235959_123456"
+    base.mkdir(parents=True)
+    existing_record = base / "session.json"
+    existing_record.write_bytes(b"previous participant data")
+    existing_file = base.with_name(base.name + "_02")
+    existing_file.write_bytes(b"existing file must also survive")
+    recorder = make_recorder(tmp_path)
+    try:
+        assert recorder.path == base.with_name(base.name + "_03")
+        assert existing_record.read_bytes() == b"previous participant data"
+        assert list(base.iterdir()) == [existing_record]
+        assert existing_file.read_bytes() == b"existing file must also survive"
+    finally:
+        recorder.shutdown()
+
+
+def test_session_directory_permission_failure_is_not_treated_as_collision(
+        tmp_path, frozen_session_datetime, monkeypatch):
+    base = tmp_path / "SIMULATED" / "P001_其他_20260921_235959_123456"
+    original_mkdir = Path.mkdir
+    attempts = []
+
+    def deny_session_mkdir(path, *args, **kwargs):
+        if path.parent == base.parent and path.name.startswith(base.name):
+            attempts.append(path)
+            raise PermissionError("injected session directory permission failure")
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", deny_session_mkdir)
+    with pytest.raises(PermissionError, match="injected session directory permission failure"):
+        make_recorder(tmp_path)
+    assert attempts == [base]
 
 
 def test_receive_window_excludes_before_and_exact_end_and_keeps_delayed_queue(tmp_path):

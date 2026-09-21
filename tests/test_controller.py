@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -175,6 +176,85 @@ def test_close_during_setup_releases_devices_and_is_idempotent(tmp_path):
     assert controller.state == "aborted"
     assert not controller._thread.is_alive()
     assert not any(device.connected for device in controller._devices.values())
+
+
+def test_close_waits_for_transport_cleanup_beyond_initial_disconnect_timeout(tmp_path, monkeypatch):
+    controller = ExperimentController(simulate=True, output_root=tmp_path)
+    adapter = controller._devices["eeg"]
+    acquiring = threading.Event()
+    cleaning_up = threading.Event()
+    release_cleanup = threading.Event()
+    closed = threading.Event()
+    errors = []
+
+    def delayed_acquire():
+        adapter.connected = True
+        acquiring.set()
+        adapter._stop.wait(3)
+        cleaning_up.set()
+        release_cleanup.wait(3)
+
+    def close_controller():
+        try:
+            controller.close()
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            closed.set()
+
+    monkeypatch.setattr(adapter, "_acquire", delayed_acquire)
+    worker = threading.Thread(target=close_controller, daemon=True)
+    try:
+        controller.connect_eeg("SIM-EEG")
+        assert acquiring.wait(1)
+        worker.start()
+        assert cleaning_up.wait(1)
+        # The adapter's first disconnect join lasts only 0.75 s. Its transport
+        # must finish cleanup before close permits a replacement controller.
+        assert not closed.wait(1)
+        assert adapter._thread.is_alive()
+        assert not controller._closed
+        release_cleanup.set()
+        assert closed.wait(2)
+        assert not errors
+        assert controller._closed
+        assert not adapter._thread.is_alive()
+        assert not adapter.connected
+        assert not controller._thread.is_alive()
+    finally:
+        release_cleanup.set()
+        if worker.ident is not None:
+            worker.join(timeout=3)
+        controller.close()
+
+
+def test_close_transport_timeout_keeps_writer_alive_and_can_be_retried(tmp_path, monkeypatch):
+    controller = ExperimentController(simulate=True, output_root=tmp_path)
+    adapter = controller._devices["eeg"]
+    original_wait = adapter.wait_disconnected
+    try:
+        inject_ready_streams(controller)
+        controller.create_session({"id": "CLOSE_RETRY", "age": 25, "sex": "其他",
+                                   "temperature_site": "左前臂"}, {})
+        monkeypatch.setattr(adapter, "wait_disconnected", lambda timeout=5: False)
+        with pytest.raises(RuntimeError, match="脑环.*尚未完全断开"):
+            controller.close()
+        assert not controller._closed
+        assert not controller._stop.is_set()
+        assert controller._thread.is_alive()
+        assert controller.recorder._thread.is_alive()
+
+        monkeypatch.setattr(adapter, "wait_disconnected", original_wait)
+        controller.close()
+        assert controller._closed
+        assert not controller._thread.is_alive()
+        assert not controller.recorder._thread.is_alive()
+        manifest = json.loads((controller.recorder.path / "session.json").read_text(encoding="utf-8"))
+        assert manifest["status"] == "aborted"
+        controller.close()
+    finally:
+        monkeypatch.setattr(adapter, "wait_disconnected", original_wait)
+        controller.close()
 
 
 def test_three_seconds_without_valid_data_interrupts_stage(tmp_path):

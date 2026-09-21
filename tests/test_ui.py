@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+from pathlib import Path
 import threading
 
 import pytest
@@ -110,6 +111,22 @@ def window(qtbot, tmp_path):
     yield widget, controller
     widget._confirm = lambda *args: True
     widget.close()
+
+
+@pytest.fixture
+def replacement_controllers(monkeypatch):
+    replacements = []
+
+    def create_controller(*, simulate, output_root, temperature_enabled):
+        replacement = FakeController()
+        replacement.data["mode"] = "simulate" if simulate else "hardware"
+        replacement.set_temperature_enabled(temperature_enabled)
+        replacements.append((dict(simulate=simulate, output_root=output_root,
+                                  temperature_enabled=temperature_enabled), replacement))
+        return replacement
+
+    monkeypatch.setattr("mist_app.ui.ExperimentController", create_controller)
+    return replacements
 
 
 def test_information_and_start_require_all_enabled_devices_ready(window, qtbot):
@@ -313,3 +330,221 @@ def test_interrupted_stage_retry_and_close_confirmation(window, qtbot):
     widget._confirm = lambda *args: True
     widget.close()
     assert controller.closed
+
+
+@pytest.mark.parametrize("final_state,temperature_enabled,simulate", [
+    ("completed", True, True), ("completed", False, False),
+    ("aborted", True, False), ("aborted", False, True),
+])
+def test_repeat_experiment_resets_subject_and_requires_fresh_devices(
+        window, qtbot, replacement_controllers, final_state, temperature_enabled, simulate):
+    widget, controller = window
+    controller.set_temperature_enabled(temperature_enabled)
+    controller.set_ready()
+    controller.data.update(state=final_state, mode="simulate" if simulate else "hardware",
+                           session_path="C:/test/PREVIOUS", stage_index=5, stage_key="recovery")
+    blocker = QtCore.QSignalBlocker(widget.simulation)
+    widget.simulation.setChecked(simulate)
+    del blocker
+    widget.refresh()
+    qtbot.waitUntil(lambda: any(scene_id == 1 for scene_id, _ in controller.presented))
+    widget.subject_id.setText("PREVIOUS")
+    widget.age.setValue(62)
+    widget.sex.setCurrentIndex(2)
+    widget.note.setText("上一次的备注")
+    widget.temperature_site.setText("右手背")
+    widget.answer.setText("-31")
+    widget._touch_rating()
+    widget.rating_slider.setValue(91)
+    for index, spin in enumerate(widget.durations.values()):
+        spin.setValue(11 + index)
+    durations = {key: float(spin.value()) for key, spin in widget.durations.items()}
+    output_root = Path(widget.output_root.text()) / "collection"
+    widget.output_root.setText(str(output_root))
+    previous_data = controller.snapshot()
+
+    assert widget.restart_button.isVisible()
+    assert widget.restart_button.isEnabled()
+    assert widget.restart_button.text() == "再次实验"
+    assert widget.open_folder_button.isVisible()
+    qtbot.mouseClick(widget.restart_button, QtCore.Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: bool(replacement_controllers) and not widget._busy)
+
+    options, replacement = replacement_controllers[0]
+    assert len(replacement_controllers) == 1
+    assert controller.closed
+    assert controller.snapshot() == previous_data
+    assert options == dict(simulate=simulate, output_root=output_root,
+                           temperature_enabled=temperature_enabled)
+    assert widget.controller is replacement
+    assert widget.pages.currentIndex() == 0
+    assert widget.subject_id.text() == ""
+    assert widget.age.value() == 25
+    assert widget.sex.currentData() == ""
+    assert widget.note.text() == ""
+    assert widget.temperature_site.text() == ""
+    assert widget.temperature_site.isVisible() == temperature_enabled
+    assert widget.temperature_enabled.isChecked() == temperature_enabled
+    assert widget.simulation.isChecked() == simulate
+    assert widget.simulation.isEnabled()
+    assert widget.temperature_enabled.isEnabled()
+    assert widget.output_root.text() == str(output_root)
+    assert {key: float(spin.value()) for key, spin in widget.durations.items()} == durations
+    assert widget.answer.text() == ""
+    assert widget.rating_slider.value() == 50
+    assert not widget._rating_touched
+    assert not widget.rating_button.isEnabled()
+    assert widget.session_path_label.text() == ""
+    assert not widget.restart_button.isVisible()
+    assert not widget.open_folder_button.isVisible()
+    assert not widget.subject_id.isEnabled()
+    assert not widget.create_button.isEnabled()
+    assert not replacement.data["ready"]
+    assert all(not device["connected"] and not device["ready"]
+               for device in replacement.data["devices"].values())
+    assert widget.cards["ppg"].device_picker.currentData() == "COM7"
+    if temperature_enabled:
+        assert widget.cards["temperature"].device_picker.currentData() == "COM8"
+    if simulate:
+        assert widget.cards["eeg"].device_picker.currentData() == "00:11:22:33:44:55"
+
+    replacement.set_ready()
+    widget.refresh()
+    assert widget.subject_id.isEnabled()
+    errors = []
+    widget._error = errors.append
+    qtbot.mouseClick(widget.create_button, QtCore.Qt.MouseButton.LeftButton)
+    assert replacement.created is None
+    assert "被试编号" in errors[-1]
+    widget.subject_id.setText("NEXT")
+    qtbot.mouseClick(widget.create_button, QtCore.Qt.MouseButton.LeftButton)
+    assert replacement.created is None
+    assert "性别" in errors[-1]
+    widget.sex.setCurrentIndex(1)
+    if temperature_enabled:
+        qtbot.mouseClick(widget.create_button, QtCore.Qt.MouseButton.LeftButton)
+        assert replacement.created is None
+        assert "温度测量部位" in errors[-1]
+        widget.temperature_site.setText("左手背")
+    qtbot.mouseClick(widget.create_button, QtCore.Qt.MouseButton.LeftButton)
+    participant = dict(id="NEXT", age=25, sex="female", note="")
+    if temperature_enabled:
+        participant["temperature_site"] = "左手背"
+    assert replacement.created == (participant, durations, output_root)
+    assert widget.pages.currentIndex() == 1
+    # Controllers reuse scene IDs: the new session must still record its first presentation.
+    qtbot.waitUntil(lambda: any(scene_id == 1 for scene_id, _ in replacement.presented))
+    qtbot.mouseClick(widget.stage_action, QtCore.Qt.MouseButton.LeftButton)
+    assert replacement.data["state"] == "running"
+
+
+def test_repeat_waits_for_close_without_blocking_gui_or_starting_twice(
+        window, qtbot, monkeypatch, replacement_controllers):
+    widget, controller = window
+    controller.data.update(state="completed", session_path="C:/test/PREVIOUS")
+    widget.refresh()
+    started, release = threading.Event(), threading.Event()
+    close_threads = []
+    original_close = controller.close
+
+    def slow_close():
+        close_threads.append(threading.get_ident())
+        started.set()
+        if not release.wait(3):
+            raise RuntimeError("测试关闭超时")
+        original_close()
+
+    monkeypatch.setattr(controller, "close", slow_close)
+    try:
+        qtbot.mouseClick(widget.restart_button, QtCore.Qt.MouseButton.LeftButton)
+        qtbot.waitUntil(started.is_set)
+        heartbeat = []
+        QtCore.QTimer.singleShot(0, lambda: heartbeat.append(True))
+        qtbot.waitUntil(lambda: bool(heartbeat))
+        assert not widget.restart_button.isEnabled()
+        assert widget.controller is controller
+        assert widget.pages.currentIndex() == 1
+        assert not replacement_controllers
+        widget._restart_experiment()
+        qtbot.mouseClick(widget.restart_button, QtCore.Qt.MouseButton.LeftButton)
+        assert len(close_threads) == 1
+        assert close_threads[0] != threading.get_ident()
+    finally:
+        release.set()
+    qtbot.waitUntil(lambda: bool(replacement_controllers) and not widget._busy)
+    assert len(replacement_controllers) == 1
+    assert controller.closed
+    assert widget.pages.currentIndex() == 0
+
+
+def test_repeat_close_failure_keeps_previous_result_and_allows_retry(
+        window, qtbot, monkeypatch, replacement_controllers):
+    widget, controller = window
+    controller.data.update(state="completed", session_path="C:/test/PREVIOUS")
+    widget.subject_id.setText("PREVIOUS")
+    widget.refresh()
+    original_close = controller.close
+    previous_data = controller.snapshot()
+    errors = []
+    widget._error = errors.append
+
+    def failed_close():
+        raise RuntimeError("设备关闭失败")
+
+    monkeypatch.setattr(controller, "close", failed_close)
+    qtbot.mouseClick(widget.restart_button, QtCore.Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: bool(errors) and not widget._busy)
+    assert "设备关闭失败" in str(errors[0])
+    assert widget.controller is controller
+    assert not replacement_controllers
+    assert controller.snapshot() == previous_data
+    assert widget.subject_id.text() == "PREVIOUS"
+    assert widget.pages.currentIndex() == 1
+    assert "C:/test/PREVIOUS" in widget.session_path_label.text()
+    assert widget.open_folder_button.isVisible()
+    assert widget.restart_button.isEnabled()
+    assert widget.timer.isActive()
+
+    monkeypatch.setattr(controller, "close", original_close)
+    qtbot.mouseClick(widget.restart_button, QtCore.Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: bool(replacement_controllers) and not widget._busy)
+    assert widget.pages.currentIndex() == 0
+
+
+@pytest.mark.parametrize("state,saving", [
+    ("setup", False), ("instruction", False), ("running", False), ("rating", False),
+    ("interrupted", False), ("saving", True), ("error", False),
+    ("completed", True), ("aborted", True),
+])
+def test_repeat_is_unavailable_until_session_is_finished_and_saved(
+        window, replacement_controllers, state, saving):
+    widget, controller = window
+    controller.data.update(state=state, saving=saving,
+                           session_path="" if state == "setup" else "C:/test/PREVIOUS")
+    widget.refresh()
+    if state in ("completed", "aborted"):
+        assert not widget.restart_button.isEnabled()
+    else:
+        assert not widget.restart_button.isVisible()
+    widget._restart_experiment()
+    assert not controller.closed
+    assert widget.controller is controller
+    assert not replacement_controllers
+
+
+def test_repeat_waits_for_outstanding_device_operation(window, qtbot, replacement_controllers):
+    widget, controller = window
+    controller.data.update(state="aborted", session_path="C:/test/PREVIOUS")
+    release = threading.Event()
+    widget._run_async("scan_eeg", lambda: release.wait(3))
+    try:
+        widget.refresh()
+        assert widget.restart_button.isVisible()
+        assert not widget.restart_button.isEnabled()
+        widget._restart_experiment()
+        assert not controller.closed
+        assert not replacement_controllers
+    finally:
+        release.set()
+    qtbot.waitUntil(lambda: not widget._busy)
+    assert widget.restart_button.isEnabled()
